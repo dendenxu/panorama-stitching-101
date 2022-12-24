@@ -97,17 +97,21 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
     match = match[..., 0]  # only the largest value correspond to dist B, N, cloest is on diagonal
     dist = min2[..., 0] / min2[..., 1]  # unambiguous match should have low distance here B, B, N,
     # dist = min2[..., 0]  # ambiguous matches also present B, B, N,
-    pivot = dist.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
-
-    # Rearranage images and downscaled images according to pivot image selection
-    match = torch.cat([match[pivot, :pivot], match[pivot, pivot + 1:]])  # B-1, N, source feat id
-    dist = torch.cat([dist[pivot, :pivot], dist[pivot, pivot + 1:]])  # B-1, N, source feat id
 
     # Select valid threshold -> might not be wise to batch since every image pair is different...
     # threshold = dist.ravel().topk(int(dist.numel() * (1 - match_ratio))).values.min()  # the ratio used to discard unmatched values
     threshold = match_ratio
     log(f'Thresholding matches with: {colored(f"{threshold:.6f}", "yellow")}')
-    matched = (dist <= threshold).nonzero()  # M, 2 # MARK: SYNC
+
+    matched = dist <= threshold  # number of matches per image? B, B, N
+    # pivot = dist.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
+    pivot = matched.sum(-1).sum(-1).argmax().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
+    # Rearranage images and downscaled images according to pivot image selection
+    matched = torch.cat([matched[pivot, :pivot], matched[pivot, pivot + 1:]])  # B-1, N, source feat id
+    match = torch.cat([match[pivot, :pivot], match[pivot, pivot + 1:]])  # B-1, N, source feat id
+    dist = torch.cat([dist[pivot, :pivot], dist[pivot, pivot + 1:]])  # B-1, N, source feat id
+
+    matched = matched.nonzero()  # M, 2 # MARK: SYNC
     match = torch.cat([matched, match[matched.chunk(2, dim=-1)]], dim=-1)  # M, 3 # image id, pivot feat id, source feat id
     return pivot, match
 
