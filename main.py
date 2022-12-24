@@ -85,13 +85,13 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .9) -> Tuple[int, 
     # B, B, N, N -> every image pair, every distance pair -> 36 * 500 * 500 * 128 * 4 / 2**20 MB
     # half of memory and computation wasted
     B, N, C = desc.shape
-    # ssd = (desc[:, None, :, None, :] - desc[None, :, None, :, :]).pow(2).sum(-1).sqrt()  # BBNN sum of squared error, diagonal values should be ignored
-    exp = desc[None].expand(B, B, N, C).reshape(B * B, N, C)
-    ssd = torch.cdist(exp, exp).view(B, B, N, N)  # some numeric error here?
+    ssd = (desc[:, None, :, None, :] - desc[None, :, None, :, :]).pow(2).sum(-1).sqrt()  # BBNN sum of squared error, diagonal values should be ignored
+    # exp = desc[None].expand(B, B, N, C).reshape(B * B, N, C)
+    # ssd = torch.cdist(exp, exp).view(B, B, N, N)  # some numeric error here?
 
     # Find the one with cloest match to other images as the pivot (# ? not scalable?)
     min2, match = ssd.topk(2, dim=-1, largest=False)  # find closest distance
-    match = match[..., 0]  # only the largest value corresponde to dist B, N, cloest is on diagonal
+    match = match[..., 0]  # only the largest value correspond to dist B, N, cloest is on diagonal
     dist = min2[..., 0] / min2[..., 1]  # unambiguous match should have low distance here B, B, N,
     pivot = dist.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
 
@@ -100,8 +100,9 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .9) -> Tuple[int, 
     dist = torch.cat([dist[pivot, :pivot], dist[pivot, pivot + 1:]])  # B-1, N, source feat id
 
     # Select valid threshold -> might not be wise to batch since every image pair is different...
+    # __import__('ipdb').set_trace()
     threshold = dist.ravel().topk(int(dist.numel() * (1 - match_ratio))).values.min()  # the ratio used to discard unmatched values
-    matched = (dist < threshold).nonzero()  # M, 2 # MARK: SYNC
+    matched = (dist <= threshold).nonzero()  # M, 2 # MARK: SYNC
     match = torch.cat([matched, match[matched.chunk(2, dim=-1)]], dim=-1)  # M, 3 # image id, pivot feat id, source feat id
     return pivot, match
 
@@ -230,7 +231,6 @@ def visualize_matches(imgs_pivot: torch.Tensor,
     kps_pivot = [cv2.KeyPoint(*d) for d in kps_pivot]
 
     match = match[match[..., 0].argsort()]  # sort by image id
-    __import__('ipdb').set_trace()
     uni, _, _, ind = unique_with_indices(match[..., 0], sorted=True)
 
     # From now on, use numpy instead of tensors since we're writing output
