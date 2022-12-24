@@ -30,7 +30,7 @@ traceback.install()
 
 
 class FeatureDetector(nn.Module):
-    def __init__(self, PS=41, n_features=500) -> None:
+    def __init__(self, PS=41, n_features=1000) -> None:
         super().__init__()
         self.PS = PS
         self.n_features = n_features
@@ -81,12 +81,13 @@ def pack_laf_into_opencv_fmt(lafs: torch.Tensor, resp: torch.Tensor):
     return packed
 
 
-def feature_matching(descs: torch.Tensor, match_ratio: float = .9) -> Tuple[int, torch.Tensor]:
+def feature_matching(desc: torch.Tensor, match_ratio: float = .9) -> Tuple[int, torch.Tensor]:
     # B, B, N, N -> every image pair, every distance pair -> 36 * 500 * 500 * 128 * 4 / 2**20 MB
     # half of memory and computation wasted
-    pvt = descs[:, None, :, None, :]  # B, 1, N, 1, 128
-    src = descs[None, :, None, :, :]  # 1, B, 1, N, 128
-    ssd = (pvt - src).pow(2).sum(-1)  # BBNN sum of squared error, diagonal values should be ignored
+    B, N, C = desc.shape
+    # ssd = (desc[:, None, :, None, :] - desc[None, :, None, :, :]).pow(2).sum(-1).sqrt()  # BBNN sum of squared error, diagonal values should be ignored
+    exp = desc[None].expand(B, B, N, C).reshape(B * B, N, C)
+    ssd = torch.cdist(exp, exp).view(B, B, N, N)  # some numeric error here?
 
     # Find the one with cloest match to other images as the pivot (# ? not scalable?)
     min2, match = ssd.topk(2, dim=-1, largest=False)  # find closest distance
@@ -129,6 +130,10 @@ def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor):
     h = V[:, -1]  # 9, the homography
     H = h.view(3, 3) / h[-1]  # normalize homography to 1
     return H  # xp = H x
+
+
+def RANSAC_DLT_M(pvt: torch.Tensor, src: torch.Tensor):
+    pass
 
 
 def unique_with_indices(x: torch.Tensor, sorted=False, dim=-1):
@@ -204,6 +209,7 @@ def visualize_matches(imgs_pivot: torch.Tensor,
                       resp: torch.Tensor,
                       match: torch.Tensor,  # M, 3
                       paths: List[str],
+                      pivot: int,
                       ratio=1.0):
     pack_pivot = pack_laf_into_opencv_fmt(lafs_pivot, resp_pivot)  # B, N, 4
     pack_pivot[..., :2] = pack_pivot[..., :2] / ratio
@@ -224,6 +230,7 @@ def visualize_matches(imgs_pivot: torch.Tensor,
     kps_pivot = [cv2.KeyPoint(*d) for d in kps_pivot]
 
     match = match[match[..., 0].argsort()]  # sort by image id
+    __import__('ipdb').set_trace()
     uni, _, _, ind = unique_with_indices(match[..., 0], sorted=True)
 
     # From now on, use numpy instead of tensors since we're writing output
@@ -232,11 +239,14 @@ def visualize_matches(imgs_pivot: torch.Tensor,
     match = match.detach().cpu().numpy()
 
     # For now, only consider matched points of the first image?
+    def get_actual_idx(idx, pivot=pivot): return idx if idx < pivot else idx + 1
     for idx, curr, next in zip(uni, ind, np.concatenate([ind[1:], np.array([len(match)])])):
         idx = int(idx)
         curr = int(curr)
         next = int(next)
-
+        size = next - curr
+        log(f'Visualizing image pair: {colored(f"{pivot:02d}-{get_actual_idx(idx):02d}", "magenta")}, matches: {colored(f"{size}", "magenta")}')
+        
         # Prepare source images
         path = paths[idx]
         img = imgs[idx]
@@ -263,8 +273,9 @@ def main():
     parser.add_argument('--data_root', default='data/data1')
     parser.add_argument('--output_dir', default='output')
     parser.add_argument('--ext', default='.JPG')
-    parser.add_argument('--device', default='cuda')
-    parser.add_argument('--ratio', default=0.5, type=float)  # otherwise, typicall out of memory
+    parser.add_argument('--device', default='cpu')
+    parser.add_argument('--n_feat', default=1000, type=int)  # otherwise, typicall out of memory
+    parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typicall out of memory
     parser.add_argument('--match_ratio', default=0.5, type=float)  # otherwise, typicall out of memory
     args = parser.parse_args()
 
@@ -278,7 +289,7 @@ def main():
 
     # Perform feature detection (use kornia implementation)
     log(f'Performing feature detection using: {args.device}')
-    feature_detector = FeatureDetector().to(args.device, non_blocking=True)  # the actual feature detector
+    feature_detector = FeatureDetector(n_features=args.n_feat).to(args.device, non_blocking=True)  # the actual feature detector
     with torch.no_grad():
         lafs, desc, resp = feature_detector(down)  # B, N, 128 -> batch size, number of descs, desc dimensionality
 
@@ -318,7 +329,8 @@ def main():
                       resp,
                       match,
                       [join(args.data_root, args.output_dir, f'match_{pivot:02d}-{get_actual_idx(i):02d}.jpg') for i in range(B)],
-                      args.ratio)
+                      pivot,
+                      args.ratio,)
 
     # Construct matched feature pairs from matching results
     pvt = packed_pivot[0, match[..., 1], :2]  # M, 2, discarding scale, orientation, and response
@@ -337,7 +349,7 @@ def main():
         next = int(next)  # MARK: SYNC
         # next_appearance - first_appearance records the size
         size = next - curr
-        log(f'processsing image pair: {colored(f"{pivot:02d}-{get_actual_idx(idx):02d}", "magenta")}, matches: {colored(f"{size}", "magenta")}')
+        log(f'Processing image pair: {colored(f"{pivot:02d}-{get_actual_idx(idx):02d}", "magenta")}, matches: {colored(f"{size}", "magenta")}')
         pvt_pair = pvt[curr:next]
         src_pair = src[curr:next]
         pvt_pair = pvt_pair / args.ratio  # use original image when stitching
@@ -360,7 +372,7 @@ def main():
     # blended = (pvt_canvas + src_canvas) / 2
     # return blended
 
-    save_image(join(args.data_root, args.output_dir, 'merged.jpg'), trans.permute(1, 2, 0).detach().cpu().numpy())
+    # save_image(join(args.data_root, args.output_dir, 'merged.jpg'), trans.permute(1, 2, 0).detach().cpu().numpy())
 
 
 if __name__ == "__main__":
