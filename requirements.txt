@@ -1,0 +1,7 @@
+tqdm
+torch # it's never that simple to install pytorch. actually we advise using conda
+numpy
+pillow
+kornia
+termcolor
+opencv-python
