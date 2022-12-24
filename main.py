@@ -93,6 +93,7 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .9) -> Tuple[int, 
     min2, match = ssd.topk(2, dim=-1, largest=False)  # find closest distance
     match = match[..., 0]  # only the largest value correspond to dist B, N, cloest is on diagonal
     dist = min2[..., 0] / min2[..., 1]  # unambiguous match should have low distance here B, B, N,
+    # dist = min2[..., 0]  # unambiguous match should have low distance here B, B, N,
     pivot = dist.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
 
     # Rearranage images and downscaled images according to pivot image selection
@@ -142,7 +143,7 @@ def unique_with_indices(x: torch.Tensor, sorted=False, dim=-1):
         unique, inverse, counts = torch.unique_consecutive(x, dim=dim, return_inverse=True, return_counts=True)
     else:
         unique, inverse, counts = torch.unique(x, dim=dim, sorted=True, return_inverse=True, return_counts=True)
-    _, ind_sorted = torch.sort(inverse)
+    _, ind_sorted = torch.sort(inverse, stable=True)
     cum_sum: torch.Tensor = counts.cumsum(0)
     cum_sum = torch.cat((torch.tensor([0], device=cum_sum.device, dtype=cum_sum.dtype), cum_sum[:-1]))
     indices = ind_sorted[cum_sum]
