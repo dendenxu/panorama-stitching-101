@@ -81,19 +81,22 @@ def pack_laf_into_opencv_fmt(lafs: torch.Tensor, resp: torch.Tensor):
     return packed
 
 
-def feature_matching(desc: torch.Tensor, match_ratio: float = .9) -> Tuple[int, torch.Tensor]:
+def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, torch.Tensor]:
     # B, B, N, N -> every image pair, every distance pair -> 36 * 500 * 500 * 128 * 4 / 2**20 MB
     # half of memory and computation wasted
     B, N, C = desc.shape
-    ssd = (desc[:, None, :, None, :] - desc[None, :, None, :, :]).pow(2).sum(-1).sqrt()  # BBNN sum of squared error, diagonal values should be ignored
-    # exp = desc[None].expand(B, B, N, C).reshape(B * B, N, C)
-    # ssd = torch.cdist(exp, exp).view(B, B, N, N)  # some numeric error here?
+    # pvt = desc[:, None, :, None, :]
+    # src =  desc[None, :, None, :, :]
+    # ssd = (pvt - src).pow(2).sum(-1).sqrt()  # BBNN sum of squared error, diagonal values should be ignored
+    pvt = desc[:, None].expand(B, B, N, C).reshape(B * B, N, C)
+    src = desc[None, :].expand(B, B, N, C).reshape(B * B, N, C)
+    ssd = torch.cdist(pvt, src, compute_mode='donot_use_mm_for_euclid_dist').view(B, B, N, N)  # some numeric error here?
 
     # Find the one with cloest match to other images as the pivot (# ? not scalable?)
     min2, match = ssd.topk(2, dim=-1, largest=False)  # find closest distance
     match = match[..., 0]  # only the largest value correspond to dist B, N, cloest is on diagonal
     dist = min2[..., 0] / min2[..., 1]  # unambiguous match should have low distance here B, B, N,
-    # dist = min2[..., 0]  # unambiguous match should have low distance here B, B, N,
+    # dist = min2[..., 0]  # ambiguous matches also present B, B, N,
     pivot = dist.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
 
     # Rearranage images and downscaled images according to pivot image selection
@@ -101,8 +104,9 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .9) -> Tuple[int, 
     dist = torch.cat([dist[pivot, :pivot], dist[pivot, pivot + 1:]])  # B-1, N, source feat id
 
     # Select valid threshold -> might not be wise to batch since every image pair is different...
-    # __import__('ipdb').set_trace()
-    threshold = dist.ravel().topk(int(dist.numel() * (1 - match_ratio))).values.min()  # the ratio used to discard unmatched values
+    # threshold = dist.ravel().topk(int(dist.numel() * (1 - match_ratio))).values.min()  # the ratio used to discard unmatched values
+    threshold = match_ratio
+    log(f'Thresholding matches with: {colored(f"{threshold:.6f}", "yellow")}')
     matched = (dist <= threshold).nonzero()  # M, 2 # MARK: SYNC
     match = torch.cat([matched, match[matched.chunk(2, dim=-1)]], dim=-1)  # M, 3 # image id, pivot feat id, source feat id
     return pivot, match
@@ -128,6 +132,8 @@ def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor):
 
     U, S, Vh = torch.linalg.svd(A, full_matrices=True)
     V = Vh.mH  # Vh is the conjugate transpose of V
+    # V = Vh  # Vh is the conjugate transpose of V
+    log(f'reprojection error: {colored(f"{S[-1].item():.6f}", "yellow")}')
 
     h = V[:, -1]  # 9, the homography
     H = h.view(3, 3) / h[-1]  # normalize homography to 1
@@ -247,7 +253,7 @@ def visualize_matches(imgs_pivot: torch.Tensor,
         next = int(next)
         size = next - curr
         log(f'Visualizing image pair: {colored(f"{pivot:02d}-{get_actual_idx(idx):02d}", "magenta")}, matches: {colored(f"{size}", "magenta")}')
-        
+
         # Prepare source images
         path = paths[idx]
         img = imgs[idx]
@@ -277,7 +283,7 @@ def main():
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--n_feat', default=1000, type=int)  # otherwise, typicall out of memory
     parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typicall out of memory
-    parser.add_argument('--match_ratio', default=0.5, type=float)  # otherwise, typicall out of memory
+    parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typicall out of memory
     args = parser.parse_args()
 
     # Loading images from disk and downscale them
