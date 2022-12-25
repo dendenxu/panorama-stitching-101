@@ -138,7 +138,7 @@ def exhaustive_feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> 
     @chunkify(chunk_size=chunk_size)
     def chunked_cdist(x, y): return torch.cdist(x, y)
     ssd = chunked_cdist(pvt, src)
-    ssd = ssd.view(B, B, N, N) # if the final tensor would be too large would not be ok
+    ssd = ssd.view(B, B, N, N)  # if the final tensor would be too large would not be ok
 
     # Type conversion for numerical stability
     ssd = ssd.to(dtype)  # some numeric error here?
@@ -263,7 +263,8 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     img = F.grid_sample(img.view(-1, *img.shape[-3:]), xy.view(-1, *xy.shape[-3:]), align_corners=False, padding_mode='zeros', mode='bilinear').view(*sh, img.shape[-3], *xy.shape[-3:-1])  # 3, mH, mW
 
     # Valid pixel values
-    msk = (xy > -1).all(-1) & (xy < 1).all(-1)  # both x and y need to meet crit
+    msk = (xy > -0.99 + torch.finfo(xy.dtype).eps).all(-1) & (xy < 0.99 - torch.finfo(xy.dtype).eps).all(-1)  # both x and y need to meet crit, be agressive
+    img = img * msk
 
     return min_x, min_y, max_x, max_y, img, msk
 
@@ -678,9 +679,9 @@ def main():
     for min_x, min_y, max_x, max_y, img, msk in ret:
         x = min_x - can_min_x
         y = min_y - can_min_y
-        canvas[..., y:y + img.shape[1], x:x + img.shape[2]] += img * (msk > 0)
+        canvas[..., y:y + img.shape[1], x:x + img.shape[2]] += img
         accumu[..., y:y + img.shape[1], x:x + img.shape[2]] += msk
-    canvas = canvas / accumu.clip(1e-6)  # naive linear blending
+    canvas = canvas / accumu.clip(1e-6) * (accumu > 0)  # naive linear blending
 
     # Save the blended image to disk for visualization
     result_path = join(args.data_root, args.output_dir, 'canvas.jpg')
