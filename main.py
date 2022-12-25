@@ -137,7 +137,8 @@ def exhaustive_feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> 
     chunk_size = int(np.floor((3 * 3 * 5000 * 5000) / (N * N)))
     @chunkify(chunk_size=chunk_size)
     def chunked_cdist(x, y): return torch.cdist(x, y)
-    ssd = chunked_cdist(pvt, src).view(B, B, N, N)
+    ssd = chunked_cdist(pvt, src)
+    ssd = ssd.view(B, B, N, N) # if the final tensor would be too large would not be ok
 
     # Type conversion for numerical stability
     ssd = ssd.to(dtype)  # some numeric error here?
@@ -262,7 +263,7 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     img = F.grid_sample(img.view(-1, *img.shape[-3:]), xy.view(-1, *xy.shape[-3:]), align_corners=False, padding_mode='zeros', mode='bilinear').view(*sh, img.shape[-3], *xy.shape[-3:-1])  # 3, mH, mW
 
     # Valid pixel values
-    msk = (xy >= -1).all(-1) & (xy <= 1).all(-1)  # both x and y need to meet crit
+    msk = (xy > -1).all(-1) & (xy < 1).all(-1)  # both x and y need to meet crit
 
     return min_x, min_y, max_x, max_y, img, msk
 
@@ -525,7 +526,7 @@ def main():
     parser.add_argument('--ext', default='.JPG')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--pivot', default=-1, type=int)
-    parser.add_argument('--n_feat', default=10000, type=int)  # otherwise, typically out of memory
+    parser.add_argument('--n_feat', default=5000, type=int)  # otherwise, typically out of memory
     parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typically out of memory
     parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typically out of memory
     parser.add_argument('--verbose', action='store_true')  # otherwise, typically out of memory
@@ -677,9 +678,9 @@ def main():
     for min_x, min_y, max_x, max_y, img, msk in ret:
         x = min_x - can_min_x
         y = min_y - can_min_y
-        canvas[..., y:y + img.shape[1], x:x + img.shape[2]] += img
+        canvas[..., y:y + img.shape[1], x:x + img.shape[2]] += img * (msk > 0)
         accumu[..., y:y + img.shape[1], x:x + img.shape[2]] += msk
-    canvas = canvas / accumu.clip(1e-6) * (accumu > 0)  # naive linear blending
+    canvas = canvas / accumu.clip(1e-6)  # naive linear blending
 
     # Save the blended image to disk for visualization
     result_path = join(args.data_root, args.output_dir, 'canvas.jpg')
