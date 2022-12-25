@@ -124,6 +124,11 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
     matched = matched & two_way_match  # need a two way matching to make this work?
     # pivot = dist.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
     pivot = matched.sum(-1).sum(-1).argmax().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
+
+    # Store all matches for future usage
+    all_matched = matched.nonzero()  # M, 3 # MARK: SYNC
+    all_match = torch.cat([all_matched, match[all_matched.chunk(3, dim=-1)]], dim=-1)
+
     # Rearranage images and downscaled images according to pivot image selection
     matched = torch.cat([matched[pivot, :pivot], matched[pivot, pivot + 1:]])  # B-1, N, source feat id
     match = torch.cat([match[pivot, :pivot], match[pivot, pivot + 1:]])  # B-1, N, source feat id
@@ -131,7 +136,7 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
 
     matched = matched.nonzero()  # M, 2 # MARK: SYNC
     match = torch.cat([matched, match[matched.chunk(2, dim=-1)]], dim=-1)  # M, 3 # image id, pivot feat id, source feat id
-    return pivot, match
+    return pivot, match, all_match
 
 
 def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
@@ -423,7 +428,7 @@ def main():
     parser.add_argument('--ext', default='.JPG')
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--n_feat', default=5000, type=int)  # otherwise, typically out of memory
-    parser.add_argument('--ratio', default=0.5, type=float)  # otherwise, typically out of memory
+    parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typically out of memory
     parser.add_argument('--match_ratio', default=0.25, type=float)  # otherwise, typically out of memory
     args = parser.parse_args()
 
@@ -452,7 +457,7 @@ def main():
 
     # Perform feature matching
     log(f'Performing exhaustive feature matching on: {colored(f"{args.device}", "cyan")}')
-    pivot, match = feature_matching(desc, args.match_ratio)  # M, 3 -> image id, source feat id, target feat id
+    pivot, match, all_match = feature_matching(desc, args.match_ratio)  # M, 3 -> image id, source feat id, target feat id
 
     # Visualize feature matching results
     log(f'Visualizing feature matching results')
@@ -495,7 +500,7 @@ def main():
     meta = []
     ret = []
     img = imgs_pivot[0]
-    meta.append([0, 0, 0, 0, 0, 0, 0, 0]) # NOTE: dummy values
+    meta.append([0, 0, 0, 0, 0, 0, 0, 0])  # NOTE: dummy values
     ret.append([0, 0, W, H, img, torch.ones_like(img[0], dtype=torch.bool)])  # the original image
     for idx, curr, next in zip(uni, ind, torch.cat([ind[1:], ind.new_tensor([len(pairs)])])):
         idx = int(idx)  # MARK: SYNC
