@@ -381,7 +381,7 @@ def main():
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--n_feat', default=1000, type=int)  # otherwise, typicall out of memory
     parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typicall out of memory
-    parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typicall out of memory
+    parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typically out of memory
     args = parser.parse_args()
 
     # Loading images from disk and downscale them
