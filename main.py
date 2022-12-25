@@ -164,17 +164,17 @@ def unique_with_indices(x: torch.Tensor, sorted=False, dim=-1):
     return unique, inverse, counts, indices
 
 
-def homography_transform(src: torch.Tensor, homography: torch.Tensor):
+def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     # blends two images with homography transform
     # determine the final size of the blended image to construct a canvas
     # pvt: 3, H, W
     # src: 3, H, W
     # homography: 3, 3
-    C, H, W = src.shape
+    C, H, W = img.shape
     M = max(H, W)
 
     # straight lines will always map to straight lines
-    corners = src.new_tensor([
+    corners = img.new_tensor([
         [0, 0, 1],
         [0, H / M, 1],
         [W / M, 0, 1],
@@ -190,8 +190,8 @@ def homography_transform(src: torch.Tensor, homography: torch.Tensor):
     src_W, src_H = max_x - min_x, max_y - min_y
 
     # Calculate the pixel coodinates
-    i, j = torch.meshgrid(torch.arange(src_H, dtype=src.dtype, device=src.device),
-                          torch.arange(src_W, dtype=src.dtype, device=src.device),
+    i, j = torch.meshgrid(torch.arange(src_H, dtype=img.dtype, device=img.device),
+                          torch.arange(src_W, dtype=img.dtype, device=img.device),
                           indexing='ij')  # H, W
     # 0->H, 0->W
     xy1 = torch.stack([j, i, torch.ones_like(i)], dim=-1)  # mH, mW, 3
@@ -199,11 +199,15 @@ def homography_transform(src: torch.Tensor, homography: torch.Tensor):
     xy1[..., :2] = xy1[..., :2] / M
     xy1 = xy1 @ torch.inverse(homography).mT  # mH, mW, 3
     xy = xy1[..., :2] / xy1[..., -1:]  # mH, mW, 3 / mH, mW, 1 -> x, y pixels
-    xy = xy * 2 - 1  # normalized to -1, 1
+    xy = xy * 2 - 1  # normalized to -1, 1, mH, mW, 2
 
-    src = F.grid_sample(src[None], xy[None], align_corners=False, padding_mode='zeros', mode='bilinear')[0]  # 3, mH, mW
+    # Sampled pixel values
+    img = F.grid_sample(img[None], xy[None], align_corners=False, padding_mode='zeros', mode='bilinear')[0]  # 3, mH, mW
 
-    return min_x, min_y, max_x, max_y, src
+    # Valid pixel values
+    msk = (xy > -1).all(-1) & (xy < 1).all(-1)  # both x and y need to meet crit
+
+    return min_x, min_y, max_x, max_y, img, msk
 
 
 def visualize_detection(imgs: torch.Tensor, lafs: torch.Tensor, resp: torch.Tensor, paths: List[str], ratio=1.0):
@@ -285,14 +289,14 @@ def visualize_matches(imgs_pivot: torch.Tensor,
         cv2.imwrite(path, canvas)
 
 
-def ransac_dlt_then_m(pvt: torch.Tensor,
-                      src: torch.Tensor,
-                      min_sample: int = 4,
-                      inlier_iter: int = 100,
-                      inlier_crit: float = 0.0001,
-                      confidence: float = 0.9999,
-                      max_iter: int = 10000,
-                      ):
+def ransac_dlt_m_est(pvt: torch.Tensor,
+                     src: torch.Tensor,
+                     min_sample: int = 4,
+                     inlier_iter: int = 100,
+                     inlier_crit: float = 0.0001,
+                     confidence: float = 0.9999,
+                     max_iter: int = 10000,
+                     ):
     N, C = pvt.shape
     # rand_ind = np.random.choice(N, size=(inlier_iter, min_sample))
     max_ratio = 0
@@ -309,8 +313,7 @@ def ransac_dlt_then_m(pvt: torch.Tensor,
         src_rand = src[rand]
         homography = discrete_linear_transform(pvt_rand, src_rand)
         # Apply homography for linear error estimation
-        pred = torch.cat([src, torch.ones_like(src[..., -1:])], dim=-1) @ homography.mT
-        pred = pred[..., :-1] / pred[..., -1:]
+        pred = apply_homography(src, homography)
         # Find ratio of inlier
         crit = (pred - pvt).pow(2).sum(-1)
         crit = crit < inlier_crit  # SSD critical threshold
@@ -331,7 +334,42 @@ def ransac_dlt_then_m(pvt: torch.Tensor,
         if i >= min_iter:
             break
         i += 1
-    return discrete_linear_transform(pvt_inliers, src_inliers)
+    # return discrete_linear_transform(pvt_inliers, src_inliers)
+    return m_estimator(pvt_inliers, src_inliers)
+
+
+def apply_homography(src: torch.Tensor, homography: torch.Tensor):
+    src = torch.cat([src, torch.ones_like(src[..., -1:])], dim=-1)
+    pvt = src @ homography.mT
+    pvt = pvt[..., :-1] / pvt[..., -1:]
+    return pvt
+
+
+def m_estimator(pvt: torch.Tensor, src: torch.Tensor, iter=1000, lr=1e-2):
+    def rou(error: torch.Tensor, sigma=1):
+        squared = error ** 2
+        return squared / (squared + sigma ** 2)
+
+    def sym(pvt: torch.Tensor, src: torch.Tensor, homography: torch.Tensor, homography_inv=None):
+        if homography_inv is None:
+            homography_inv = homography.inverse()
+        loss = (pvt - apply_homography(src, homography)).pow(2).sum(-1).sqrt() + (src - apply_homography(pvt, homography_inv)).pow(2).sum(-1).sqrt()
+        loss = loss.mean()
+        return loss
+
+    homography = discrete_linear_transform(pvt, src)  # initialization
+    homography.requires_grad_()
+    optim = torch.optim.Adam([homography], lr=lr)
+
+    pbar = tqdm(total=iter)
+    for i in range(iter):
+        loss = rou(sym(pvt, src, homography))  # robust symmetric loss
+        optim.zero_grad(set_to_none=True)
+        loss.backward()
+        optim.step()
+        pbar.desc = f'Loss: {loss.item():.8f}'
+        pbar.update(1)
+    return homography.detach().requires_grad_(False)
 
 
 def main():
@@ -410,6 +448,9 @@ def main():
     uni, inv, cnt, ind = unique_with_indices(pairs[..., 0], sorted=True)
 
     # For now, only consider matched points of the first image?
+    ret = []
+    img = imgs_pivot[0]
+    ret.append([0, 0, W, H, img, torch.ones_like(img[0], dtype=torch.bool)])  # the original image
     for idx, curr, next in zip(uni, ind, torch.cat([ind[1:], ind.new_tensor([len(pairs)])])):
         idx = int(idx)  # MARK: SYNC
         curr = int(curr)  # MARK: SYNC
@@ -430,27 +471,34 @@ def main():
         src_pair[..., 1] = src_pair[..., 1] / M
 
         # Appply RANSAC and M estimator
-        homography = ransac_dlt_then_m(pvt_pair, src_pair)
+        homography = ransac_dlt_m_est(pvt_pair, src_pair)
 
         # homography = discrete_linear_transform(pvt_pair, src_pair)
-        min_x, min_y, max_x, max_y, trans = homography_transform(imgs[idx], homography)
-        save_image(join(args.data_root, args.output_dir, f'trans_{pivot:02d}-{get_actual_idx(idx):02d}.jpg'), trans.permute(1, 2, 0).detach().cpu().numpy())
+        min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[idx], homography)
+        save_image(join(args.data_root, args.output_dir, f'trans_{pivot:02d}-{get_actual_idx(idx):02d}.jpg'), img.permute(1, 2, 0).detach().cpu().numpy())
         # break  # how do we deal with multiple blending?
+        ret.append([min_x, min_y, max_x, max_y, img, msk])
 
-    # # Determine canvas size:
-    # pvt_min_x, pvt_min_y = min(0, src_min_x), min(0, src_min_y)
-    # pvt_max_x, pvt_max_y = max(W, src_max_x), max(H, src_max_y)
-    # pvt_W, pvt_H = pvt_max_x - pvt_min_x, pvt_max_y - pvt_min_y
+    ret = list(zip(*ret))  # inverted batching
+    can_min_x = min(ret[0])
+    can_min_y = min(ret[1])
+    can_max_x = max(ret[2])
+    can_max_y = max(ret[3])
+    can_W = can_max_x - can_min_x  # canvas size
+    can_H = can_max_y - can_min_y  # canvas size
 
-    # # Linear blending for now (excess memory usage?)
-    # pvt_canvas = pvt.new_zeros((C, int(pvt_H), int(pvt_W)))  # 3, pH, pW
-    # src_canvas = pvt.new_zeros((C, int(pvt_H), int(pvt_W)))  # 3, pH, pW
-    # pvt_canvas[-pvt_min_y:H, -pvt_min_x:W] = pvt
-    # src_canvas[-pvt_min_y - src_min_y:src_H, -pvt_min_x - src_min_x:src_W] = src
-    # blended = (pvt_canvas + src_canvas) / 2
-    # return blended
+    canvas = torch.zeros((3, can_H, can_W), dtype=torch.float, device=args.device)
+    accumu = torch.zeros((1, can_H, can_W), dtype=torch.float, device=args.device)
 
-    # save_image(join(args.data_root, args.output_dir, 'merged.jpg'), trans.permute(1, 2, 0).detach().cpu().numpy())
+    # Linear blending for now (excess memory usage?)
+    for min_x, min_y, max_x, max_y, img, msk in zip(*ret):
+        x = min_x - can_min_x
+        y = min_y - can_min_y
+        canvas[..., y:y + img.shape[1], x:x + img.shape[2]] = img
+        accumu[..., y:y + img.shape[1], x:x + img.shape[2]] = msk
+    canvas = canvas / accumu.clip(1e-6)
+
+    save_image(join(args.data_root, args.output_dir, 'canvas.jpg'), canvas.permute(1, 2, 0).detach().cpu().numpy())
 
 
 if __name__ == "__main__":
