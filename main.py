@@ -100,7 +100,7 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
 
     # Find actual two-way matching results
     reversed = (torch.zeros_like(match) - 1).scatter_(dim=-1, index=match.permute(1, 0, 2), src=torch.arange(N, device=match.device, dtype=match.dtype)[None, None].expand(B, B, N))  # valid index, B, B, N
-    two_way_match = match == reversed # B, B, N
+    two_way_match = match == reversed  # B, B, N
 
     # Select valid threshold -> might not be wise to batch since every image pair is different...
     # threshold = dist.ravel().topk(int(dist.numel() * (1 - match_ratio))).values.min()  # the ratio used to discard unmatched values
@@ -121,12 +121,15 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
     return pivot, match
 
 
-def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor):
+def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor) -> torch.Tensor:
     # given feature point pairs, solve them with DLT algorithm
     # pvt: N, 2 # the x prime vector
     # src: N, 2 # the x vector
+    dtype = pvt.dtype
+    pvt = pvt.double()
+    src = src.double()  # otherwise would be numerically instable
 
-    assert pvt.shape[0] > 4 and src.shape == pvt.shape, f'Needs at least four points for homography with matching shape: {pvt.shape}, {src.shape}'
+    assert pvt.shape[0] >= 4 and src.shape == pvt.shape, f'Needs at least four points for homography with matching shape: {pvt.shape}, {src.shape}'
 
     # assemble feature points into big A matrix
     # 0, 0, 0, -x, -y, -1,  y'x,  y'y,  y'
@@ -146,7 +149,7 @@ def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor):
 
     h = V[:, -1]  # 9, the homography
     H = h.view(3, 3) / h[-1]  # normalize homography to 1
-    return H  # xp = H x
+    return H.to(dtype)  # xp = H x
 
 
 def unique_with_indices(x: torch.Tensor, sorted=False, dim=-1):
@@ -168,16 +171,18 @@ def homography_transform(src: torch.Tensor, homography: torch.Tensor):
     # src: 3, H, W
     # homography: 3, 3
     C, H, W = src.shape
+    M = max(H, W)
 
     # straight lines will always map to straight lines
     corners = src.new_tensor([
         [0, 0, 1],
-        [0, H, 1],
-        [W, 0, 1],
-        [W, H, 1],
+        [0, H / M, 1],
+        [W / M, 0, 1],
+        [W / M, H / M, 1],
     ])  # 4, 3
     corners = corners @ homography.mT  # 4, 3
     corners = corners[..., :-1] / corners[..., -1:]  # 4, 3 / 4, 1 -> x, y pixels
+    corners = corners * M  # renormalize pixel coordinates
     min_corner = corners.min(dim=0)[0]  # x, y for min value
     max_corner = corners.max(dim=0)[0]  # x, y for max value
     min_x, min_y = int(min_corner[0].floor().item()), int(min_corner[1].floor().item())  # MARK: SYNC
@@ -191,9 +196,10 @@ def homography_transform(src: torch.Tensor, homography: torch.Tensor):
     # 0->H, 0->W
     xy1 = torch.stack([j, i, torch.ones_like(i)], dim=-1)  # mH, mW, 3
     xy1[..., :2] = xy1[..., :2] + min_corner  # shift to origin
+    xy1[..., :2] = xy1[..., :2] / M
     xy1 = xy1 @ torch.inverse(homography).mT  # mH, mW, 3
     xy = xy1[..., :2] / xy1[..., -1:]  # mH, mW, 3 / mH, mW, 1 -> x, y pixels
-    xy = xy / xy.new_tensor([W, H]) * 2 - 1  # normalized to -1, 1
+    xy = xy * 2 - 1  # normalized to -1, 1
 
     src = F.grid_sample(src[None], xy[None], align_corners=False, padding_mode='zeros', mode='bilinear')[0]  # 3, mH, mW
 
@@ -279,8 +285,53 @@ def visualize_matches(imgs_pivot: torch.Tensor,
         cv2.imwrite(path, canvas)
 
 
-def ransac_dlt_then_m(pvt: torch.Tensor, src: torch.Tensor, min_p: int = 4):
-    pass
+def ransac_dlt_then_m(pvt: torch.Tensor,
+                      src: torch.Tensor,
+                      min_sample: int = 4,
+                      inlier_iter: int = 100,
+                      inlier_crit: float = 0.0001,
+                      confidence: float = 0.9999,
+                      max_iter: int = 10000,
+                      ):
+    N, C = pvt.shape
+    # rand_ind = np.random.choice(N, size=(inlier_iter, min_sample))
+    max_ratio = 0
+    best_fit = None
+    pvt_inliers = None
+    src_inliers = None
+    def find_min_iter(inlier_ratio, confidence, min_sample): return int(np.ceil(np.log(1 - confidence) / np.log(1 - inlier_ratio**min_sample)))
+
+    # for i, rand in zip(range(inlier_iter), rand_ind):
+    i = 0
+    while i < max_iter:
+        rand = np.random.choice(N, size=(min_sample), replace=False)
+        pvt_rand = pvt[rand]
+        src_rand = src[rand]
+        homography = discrete_linear_transform(pvt_rand, src_rand)
+        # Apply homography for linear error estimation
+        pred = torch.cat([src, torch.ones_like(src[..., -1:])], dim=-1) @ homography.mT
+        pred = pred[..., :-1] / pred[..., -1:]
+        # Find ratio of inlier
+        crit = (pred - pvt).pow(2).sum(-1)
+        crit = crit < inlier_crit  # SSD critical threshold
+        ratio = crit.sum().item() / crit.numel()  # MARK: SYNC
+        if ratio > max_ratio:
+            max_ratio = ratio
+            best_fit = homography
+            pvt_inliers = pvt[crit]  # MARK: SYNC
+            src_inliers = src[crit]  # MARK: SYNC
+        min_iter = find_min_iter(max_ratio, confidence, min_sample)
+        min_iter = min(min_iter, inlier_iter)
+        log(f'ransac random sampling:')
+        log(f'iter: {colored(f"{i}", "magenta")}')
+        log(f'min iter: {colored(f"{min_iter}", "magenta")}')
+        log(f'remaining iter: {colored(f"{min_iter - i}", "magenta")}')
+        log(f'inlier ratio: {colored(f"{ratio:.6f}", "green")}')
+        log(f'max inlier ratio: {colored(f"{max_ratio:.6f}", "green")}')
+        if i >= min_iter:
+            break
+        i += 1
+    return discrete_linear_transform(pvt_inliers, src_inliers)
 
 
 def main():
@@ -370,7 +421,18 @@ def main():
         src_pair = src[curr:next]
         pvt_pair = pvt_pair / args.ratio  # use original image when stitching
         src_pair = src_pair / args.ratio  # use original image when stitching
-        homography = discrete_linear_transform(pvt_pair, src_pair)
+
+        # Normalize pixel coordinates to roughly 0, 1 for a controlled threshold
+        M = max(H, W)
+        pvt_pair[..., 0] = pvt_pair[..., 0] / M
+        pvt_pair[..., 1] = pvt_pair[..., 1] / M
+        src_pair[..., 0] = src_pair[..., 0] / M
+        src_pair[..., 1] = src_pair[..., 1] / M
+
+        # Appply RANSAC and M estimator
+        homography = ransac_dlt_then_m(pvt_pair, src_pair)
+
+        # homography = discrete_linear_transform(pvt_pair, src_pair)
         min_x, min_y, max_x, max_y, trans = homography_transform(imgs[idx], homography)
         save_image(join(args.data_root, args.output_dir, f'trans_{pivot:02d}-{get_actual_idx(idx):02d}.jpg'), trans.permute(1, 2, 0).detach().cpu().numpy())
         # break  # how do we deal with multiple blending?
