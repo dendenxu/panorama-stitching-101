@@ -11,8 +11,8 @@ from tqdm import tqdm
 from os.path import join
 from rich import traceback
 from termcolor import colored
-from typing import Tuple, List
 import matplotlib.pyplot as plt
+from typing import Tuple, List, Callable
 
 from kornia.feature.laf import get_laf_pts_to_draw, get_laf_center, get_laf_orientation, get_laf_scale
 from kornia.feature.scale_space_detector import ScaleSpaceDetector
@@ -22,7 +22,7 @@ from kornia.color import rgb_to_grayscale
 
 import torch.nn.functional as F
 
-from utils import parallel_execution, load_image, load_unchanged, save_image, save_unchanged, list_to_tensor, tensor_to_list, normalize, log
+from utils import parallel_execution, load_image, load_unchanged, save_image, save_unchanged, list_to_tensor, tensor_to_list, normalize, log, dotdict
 traceback.install()
 
 # https://github.com/kornia/kornia-examples/blob/master/image-matching-example.ipynb
@@ -79,17 +79,68 @@ def pack_laf_into_opencv_fmt(lafs: torch.Tensor, resp: torch.Tensor):
     return packed
 
 
+def chunkify(chunk_size=8, key='img', pos=0, dim=0):  # TODO: apply this to all parameters
+    def wrapper(decoder: Callable[[torch.Tensor], torch.Tensor]):
+        def decode(*args, **kwargs):
+            # Prepare pivot args (find shape information from this arg)
+            if key in kwargs:
+                x: torch.Tensor = kwargs[key]
+            else:
+                x: torch.Tensor = args[pos]
+                args = [*args]
+            sh = x.shape[:dim]  # merged dim?
+
+            # Prepare all tensor arguments by filtering with isinstance
+            tensor_args = [v for v in args if isinstance(v, torch.Tensor)]
+            tensor_kwargs = {k: v for k, v in kwargs.items() if isinstance(v, torch.Tensor)}
+
+            # Running the actual batchified forward pass
+            ret = []
+            for i in range(0, x.shape[dim], chunk_size):
+                chunk_args = [v[(slice(None),) * dim + (slice(i, i + chunk_size), )] for v in tensor_args]
+                chunk_kwargs = {k: v[(slice(None),) * dim + (slice(i, i + chunk_size), )] for k, v in tensor_kwargs.items()}
+                ret.append(decoder(*chunk_args, **chunk_kwargs))
+
+            # Merge ret list based on reture type (single tensor or dotdict?)
+            if len(ret) and isinstance(ret[0], torch.Tensor):
+                ret = torch.cat(ret, dim=dim)
+            elif len(ret) and isinstance(ret[0], dict):
+                dict_type = type(ret)
+                ret = {k: torch.cat([v[k] for v in ret], dim=dim) for k in ret[0].keys()}
+                ret = {k: v.view(*sh, *v.shape[dim + 1:]) if x.shape[dim] == v.shape[dim] else v for k, v in ret.items()}
+                ret = dict_type(ret)
+            elif len(ret) and isinstance(ret[0], list) or isinstance(ret[0], tuple):
+                list_type = type(ret)
+                ret = [torch.cat([v[i] for v in ret], dim=dim) for i in range(len(ret[0]))]
+                ret = list_type(ret)
+            else:
+                __import__('ipdb').set_trace()
+                raise RuntimeError(f'Unsupported return type to batchify: {type(ret[0])}, or got empty return value')
+            return ret
+        return decode
+    return wrapper
+
+
 def exhaustive_feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
     # B, B, N, N -> every image pair, every distance pair -> 36 * 500 * 500 * 128 * 4 / 2**20 MB
-    # half of memory and computation wasted
     B, N, C = desc.shape
+    device = desc.device
     pvt = desc[:, None].expand(B, B, N, C).reshape(B * B, N, C)
     src = desc[None, :].expand(B, B, N, C).reshape(B * B, N, C)
-    device = desc.device
+
+    # Type conversion for numerical stability
     dtype = desc.dtype
     pvt = pvt.double()
     src = src.double()
-    ssd = torch.cdist(pvt, src).view(B, B, N, N).to(dtype)  # some numeric error here?
+
+    # Need to chunk this to avoid OOM
+    chunk_size = int(np.floor((3 * 3 * 5000 * 5000) / (N * N)))
+    @chunkify(chunk_size=chunk_size)
+    def chunked_cdist(x, y): return torch.cdist(x, y)
+    ssd = chunked_cdist(pvt, src).view(B, B, N, N)
+
+    # Type conversion for numerical stability
+    ssd = ssd.to(dtype)  # some numeric error here?
 
     # Find the one with cloest match to other images as the pivot (# ? not scalable?)
     min2, match = ssd.cpu().topk(2, dim=-1, largest=False)  # find closest distance
@@ -217,7 +268,6 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
 
 
 def visualize_detection(imgs: torch.Tensor, lafs: torch.Tensor, resp: torch.Tensor, paths: List[str], ratio=1.0):
-    # TODO: fix this
     pack = pack_laf_into_opencv_fmt(lafs, resp)  # B, N, 4
     pack[..., :2] = pack[..., :2] / ratio
     imgs = imgs.permute(0, 2, 3, 1)  # B, H, W, C
@@ -489,8 +539,7 @@ def main():
     # Loading images from disk and downscale them
     log(f'Loading images from: {cyan(args.data_root)}')
     imgs = sorted(glob(join(args.data_root, f'*{args.ext}')))
-    imgs = list_to_tensor(parallel_execution(imgs, action=load_image), args.device)  # rgb images: B, C, H, W
-    # imgs = imgs.double()
+    imgs = list_to_tensor(parallel_execution(imgs, action=load_image), args.device)  # B, C, H, W
     down, nH, nW = resize_image_tensor(imgs, args.ratio)
     B, C, H, W = imgs.shape
     scale = imgs.new_tensor([W, H])
@@ -500,20 +549,20 @@ def main():
     log(f'Performing feature detection using: {colored(f"{args.device}", "cyan")}')
     feature_detector = FeatureDetector(n_features=args.n_feat).to(args.device, non_blocking=True)  # the actual feature detector
     with torch.no_grad():
-        lafs, desc, resp = feature_detector(down)  # B, N, 128 -> batch size, number of descs, desc dimensionality
+        chunk_size = int(np.floor((8 * 3 * 1024 * 1024) / (C * nH * nW)))
+        @chunkify(chunk_size=chunk_size)
+        def chunked_feature_detector(x): return feature_detector(x)
+        lafs, desc, resp = chunked_feature_detector(down)  # B, N, 128 -> batch size, number of descs, desc dimensionality
 
     # Visualize feature detection results as images
     log(f'Visualizing detected feature at: {cyan(join(args.data_root, args.output_dir))}')
-    visualize_detection(imgs,
-                        lafs,
-                        resp,
-                        [join(args.data_root, args.output_dir, f'detect_{i:02d}.jpg') for i in range(B)],
-                        args.ratio)
+    paths = [join(args.data_root, args.output_dir, f'detect_{i:02d}.jpg') for i in range(B)]
+    visualize_detection(imgs, lafs, resp, paths, args.ratio)
 
     # Perform feature matching
     log(f'Performing exhaustive feature matching on: {colored(f"{args.device}", "cyan")}')
     pivot, valid, match, score = exhaustive_feature_matching(desc, args.match_ratio)
-    # pivot: int
+    # pivot: int, pivot image proposition
     # valid: B, B, N indicates whether a match is valid
     # match: B, B, N source image id, target image id, target feature id
     # score: B, B, N matching distance corresponding to matches indicated by match
@@ -644,9 +693,6 @@ def main():
         min_x, min_y, max_x, max_y, img, msk = ret[source]
         log(f'Pair: {magenta(f"{source:02d}-{pivot:02d}")}')
         log(f'-- Number of matches:  {magenta(cum_match)}')
-        log(f'-- Upper left corner:  {magenta(f"{min_x-can_min_x}, {min_y-can_min_x}")}')
-        log(f'-- Lower right corner: {magenta(f"{max_x-can_min_x}, {max_y-can_min_x}")}')
-        log(f'-- Valid pixel region: {magenta(f"{max_x-min_x}, {max_y-min_y}")}')
         log(f'-- Final inlier ratio: {magenta(f"{cum_ratio:.6f}")}')
         log(f'-- RANSAC iteration:   {magenta(cum_iter)}')
         log(f'-- Best connection:    {magenta(shortest_path)}')
