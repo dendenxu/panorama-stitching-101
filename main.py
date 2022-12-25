@@ -90,10 +90,13 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
     # ssd = (pvt - src).pow(2).sum(-1).sqrt()  # BBNN sum of squared error, diagonal values should be ignored
     pvt = desc[:, None].expand(B, B, N, C).reshape(B * B, N, C)
     src = desc[None, :].expand(B, B, N, C).reshape(B * B, N, C)
-    ssd = torch.cdist(pvt, src, compute_mode='donot_use_mm_for_euclid_dist').view(B, B, N, N)  # some numeric error here?
+    # ssd = torch.cdist(pvt, src, compute_mode='donot_use_mm_for_euclid_dist').view(B, B, N, N)  # some numeric error here?
+    ssd = torch.cdist(pvt, src).view(B, B, N, N)  # some numeric error here?
 
     # Find the one with cloest match to other images as the pivot (# ? not scalable?)
-    min2, match = ssd.topk(2, dim=-1, largest=False)  # find closest distance
+    device = ssd.device
+    min2, match = ssd.cpu().topk(2, dim=-1, largest=False)  # find closest distance
+    min2, match = min2.to(device, non_blocking=True), match.to(device, non_blocking=True)
     match: torch.Tensor = match[..., 0]  # only the largest value correspond to dist B, N, cloest is on diagonal
     dist: torch.Tensor = min2[..., 0] / min2[..., 1]  # unambiguous match should have low distance here B, B, N,
     # dist = min2[..., 0]  # ambiguous matches also present B, B, N,
@@ -205,7 +208,7 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     img = F.grid_sample(img[None], xy[None], align_corners=False, padding_mode='zeros', mode='bilinear')[0]  # 3, mH, mW
 
     # Valid pixel values
-    msk = (xy > -1).all(-1) & (xy < 1).all(-1)  # both x and y need to meet crit
+    msk = (xy >= -1).all(-1) & (xy <= 1).all(-1)  # both x and y need to meet crit
 
     return min_x, min_y, max_x, max_y, img, msk
 
@@ -293,10 +296,10 @@ def ransac_dlt_m_est(pvt: torch.Tensor,
                      src: torch.Tensor,
                      min_sample: int = 4,
                      inlier_iter: int = 100,
-                     inlier_crit: float = 0.0001,
-                     confidence: float = 0.9999,
+                     inlier_crit: float = 1e-5,
+                     confidence: float = 1-1e-5,
                      max_iter: int = 10000,
-                     m_repeat: int = 5,  # repeat m-estimator 10 times
+                     m_repeat: int = 2,  # repeat m-estimator 10 times
                      ):
     N, C = pvt.shape
     # rand_ind = np.random.choice(N, size=(inlier_iter, min_sample))
@@ -397,10 +400,10 @@ def main():
     parser.add_argument('--data_root', default='data/data1')
     parser.add_argument('--output_dir', default='output')
     parser.add_argument('--ext', default='.JPG')
-    parser.add_argument('--device', default='cpu')
-    parser.add_argument('--n_feat', default=1000, type=int)  # otherwise, typicall out of memory
-    parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typicall out of memory
-    parser.add_argument('--match_ratio', default=0.98, type=float)  # otherwise, typically out of memory
+    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--n_feat', default=10000, type=int)  # otherwise, typically out of memory
+    parser.add_argument('--ratio', default=0.5, type=float)  # otherwise, typically out of memory
+    parser.add_argument('--match_ratio', default=0.8, type=float)  # otherwise, typically out of memory
     args = parser.parse_args()
 
     # Loading images from disk and downscale them
@@ -515,8 +518,8 @@ def main():
     for min_x, min_y, max_x, max_y, img, msk in zip(*ret):
         x = min_x - can_min_x
         y = min_y - can_min_y
-        canvas[..., y:y + img.shape[1], x:x + img.shape[2]] = img
-        accumu[..., y:y + img.shape[1], x:x + img.shape[2]] = msk
+        canvas[..., y:y + img.shape[1], x:x + img.shape[2]] += img
+        accumu[..., y:y + img.shape[1], x:x + img.shape[2]] += msk
     canvas = canvas / accumu.clip(1e-6)
 
     save_image(join(args.data_root, args.output_dir, 'canvas.jpg'), canvas.permute(1, 2, 0).detach().cpu().numpy())
