@@ -535,7 +535,6 @@ def main():
         shortest_path = paths[source][pivot]  # number of jumps from index to pivot
 
         # Find homography transformation from source to pivot of this index
-        cnn = []
         cum = 0
         cum_match = 0
         cum_iter = 0
@@ -573,7 +572,6 @@ def main():
             cum_iter += iter_map[prev, next]
             cum_ratio *= ratio_map[prev, next]
             cum += 1
-            cnn.append(next)
 
             # If jumping, prev should updated
             prev = next
@@ -581,7 +579,7 @@ def main():
         # Apply the constructed homography transformation to get the actual result
         min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[source], cum_homo)
         ret.append([min_x, min_y, max_x, max_y, img, msk, ])
-        meta.append([pivot, source, cum_match, cum_iter, cum_ratio, cum, cnn])
+        meta.append([pivot, source, cum_match, cum_iter, cum_ratio, cum, shortest_path])
 
     ret = list(zip(*ret))  # inverted batching
     can_min_x = min(ret[0])
@@ -613,16 +611,16 @@ def main():
     # Output some summary for debugging
     log(f'Summary:')
     for source in range(len(meta)):
-        pivot, source, cum_match, cum_iter, cum_ratio, cum, cnn = meta[source]
+        pivot, source, cum_match, cum_iter, cum_ratio, cum, shortest_path = meta[source]
         min_x, min_y, max_x, max_y, img, msk = ret[source]
         log(f'Pair: {magenta(f"{source:02d}-{pivot:02d}")}')
         log(f'-- Number of matches:  {magenta(cum_match)}')
-        log(f'-- Upper left corner:  {magenta(f"{min_x-can_min_x}-{min_y-can_min_x}")}')
-        log(f'-- Lower right corner: {magenta(f"{max_x-can_min_x}-{max_y-can_min_x}")}')
-        log(f'-- Valid pixel region: {magenta(f"{max_x-min_x}-{max_y-min_y}")}')
+        log(f'-- Upper left corner:  {magenta(f"{min_x-can_min_x}, {min_y-can_min_x}")}')
+        log(f'-- Lower right corner: {magenta(f"{max_x-can_min_x}, {max_y-can_min_x}")}')
+        log(f'-- Valid pixel region: {magenta(f"{max_x-min_x}, {max_y-min_y}")}')
         log(f'-- Final inlier ratio: {magenta(f"{cum_ratio:.6f}")}')
         log(f'-- RANSAC iteration:   {magenta(cum_iter)}')
-        log(f'-- Connections:        {magenta(cnn)}')
+        log(f'-- Best connection:    {magenta(shortest_path)}')
 
 
 if __name__ == "__main__":
