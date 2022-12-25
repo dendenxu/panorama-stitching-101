@@ -94,9 +94,13 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
 
     # Find the one with cloest match to other images as the pivot (# ? not scalable?)
     min2, match = ssd.topk(2, dim=-1, largest=False)  # find closest distance
-    match = match[..., 0]  # only the largest value correspond to dist B, N, cloest is on diagonal
-    dist = min2[..., 0] / min2[..., 1]  # unambiguous match should have low distance here B, B, N,
+    match: torch.Tensor = match[..., 0]  # only the largest value correspond to dist B, N, cloest is on diagonal
+    dist: torch.Tensor = min2[..., 0] / min2[..., 1]  # unambiguous match should have low distance here B, B, N,
     # dist = min2[..., 0]  # ambiguous matches also present B, B, N,
+
+    # Find actual two-way matching results
+    reversed = (torch.zeros_like(match) - 1).scatter_(dim=-1, index=match.permute(1, 0, 2), src=torch.arange(N, device=match.device, dtype=match.dtype)[None, None].expand(B, B, N))  # valid index, B, B, N
+    two_way_match = match == reversed # B, B, N
 
     # Select valid threshold -> might not be wise to batch since every image pair is different...
     # threshold = dist.ravel().topk(int(dist.numel() * (1 - match_ratio))).values.min()  # the ratio used to discard unmatched values
@@ -104,6 +108,7 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
     log(f'Thresholding matches with: {colored(f"{threshold:.6f}", "yellow")}')
 
     matched = dist <= threshold  # number of matches per image? B, B, N
+    matched = matched & two_way_match  # need a two way matching to make this work?
     # pivot = dist.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
     pivot = matched.sum(-1).sum(-1).argmax().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
     # Rearranage images and downscaled images according to pivot image selection
@@ -142,10 +147,6 @@ def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor):
     h = V[:, -1]  # 9, the homography
     H = h.view(3, 3) / h[-1]  # normalize homography to 1
     return H  # xp = H x
-
-
-def RANSAC_DLT_M(pvt: torch.Tensor, src: torch.Tensor):
-    pass
 
 
 def unique_with_indices(x: torch.Tensor, sorted=False, dim=-1):
@@ -276,6 +277,10 @@ def visualize_matches(imgs_pivot: torch.Tensor,
         canvas = cv2.drawMatches(img_pivot, kps_pivot, img, kps, matches1to2, canvas, matchesMask=match_mask, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)  # weird...
         os.makedirs(os.path.dirname(path), exist_ok=True)
         cv2.imwrite(path, canvas)
+
+
+def ransac_dlt_then_m(pvt: torch.Tensor, src: torch.Tensor, min_p: int = 4):
+    pass
 
 
 def main():
