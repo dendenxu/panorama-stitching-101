@@ -457,7 +457,9 @@ def main():
 
     # Perform feature matching
     log(f'Performing exhaustive feature matching on: {colored(f"{args.device}", "cyan")}')
-    pivot, match, all_match = feature_matching(desc, args.match_ratio)  # M, 3 -> image id, source feat id, target feat id
+    pivot, match, all_match = feature_matching(desc, args.match_ratio)
+    # match: M, 3 -> image id, source feat id, target feat id
+    # all_match: AM, 4 -> source img id, target img id, source feat id, target feat id
 
     # Visualize feature matching results
     log(f'Visualizing feature matching results')
@@ -469,11 +471,6 @@ def main():
     lafs = torch.cat([lafs[:pivot], lafs[pivot + 1:]])  # B, C, 2, 3
     imgs = torch.cat([imgs[:pivot], imgs[pivot + 1:]])  # B, C, H, W
     down = torch.cat([down[:pivot], down[pivot + 1:]])  # B, C, nH, nW
-
-    # Pack laf representation to xy, scale, orientation, and response
-    packed_pivot = pack_laf_into_opencv_fmt(lafs_pivot, resp_pivot)  # 1, N, 4
-    packed = pack_laf_into_opencv_fmt(lafs, resp)  # B-1, N, 4
-
     def get_actual_idx(idx, pivot=pivot): return idx if idx < pivot else idx + 1
     visualize_matches(imgs_pivot,
                       lafs_pivot,
@@ -487,16 +484,16 @@ def main():
                       args.ratio,)
 
     # Construct matched feature pairs from matching results
+    packed_pivot = pack_laf_into_opencv_fmt(lafs_pivot, resp_pivot)  # 1, N, 4
+    packed = pack_laf_into_opencv_fmt(lafs, resp)  # B-1, N, 4
     pvt = packed_pivot[0, match[..., 1], :2]  # M, 2, discarding scale, orientation, and response
     src = packed[match[..., 0], match[..., 2], :2]  # M, 2
     pairs = torch.cat([match, pvt, src], dim=-1)  # M, 7 -> source image id, source feat id, target feat id, pivot xy, source xy
     pairs = pairs[torch.argsort(pairs[..., 0])]  # sort pairs by source image id
     pvt, src = pairs[..., -2 - 2:-2], pairs[..., -2:]  # sorted pairs by source image id, M, 2; M, 2
 
-    # Perform RANSAC and homography one by one for target image ids
-    uni, inv, cnt, ind = unique_with_indices(pairs[..., 0], sorted=True)
-
     # For now, only consider matched points of the first image?
+    uni, inv, cnt, ind = unique_with_indices(pairs[..., 0], sorted=True)
     meta = []
     ret = []
     img = imgs_pivot[0]
@@ -530,7 +527,6 @@ def main():
         # homography = discrete_linear_transform(pvt_pair, src_pair)
         min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[idx], homography)
         save_image(join(args.data_root, args.output_dir, f'trans_{pivot:02d}-{get_actual_idx(idx):02d}.jpg'), img.permute(1, 2, 0).detach().cpu().numpy())
-        # break  # how do we deal with multiple blending?
         ret.append([min_x, min_y, max_x, max_y, img, msk])
 
     ret = list(zip(*ret))  # inverted batching
@@ -555,6 +551,7 @@ def main():
         accumu[..., y:y + img.shape[1], x:x + img.shape[2]] += msk
     canvas = canvas / accumu.clip(1e-6) * (accumu > 0)
 
+    # Save the blended image to disk for visualization
     result_path = join(args.data_root, args.output_dir, 'canvas.jpg')
     save_image(result_path, canvas.permute(1, 2, 0).detach().cpu().numpy())
     log(f'Blended result saved to: {result_path}')
