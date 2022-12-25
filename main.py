@@ -133,10 +133,11 @@ def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor, quite=False)
     # pvt: N, 2 # the x prime vector
     # src: N, 2 # the x vector
     dtype = pvt.dtype
+    sh = pvt.shape[:-2]
     pvt = pvt.double()
     src = src.double()  # otherwise would be numerically instable
 
-    assert pvt.shape[0] >= 4 and src.shape == pvt.shape, f'Needs at least four points for homography with matching shape: {pvt.shape}, {src.shape}'
+    assert pvt.shape[-2] >= 4 and src.shape == pvt.shape, f'Needs at least four points for homography with matching shape: {pvt.shape}, {src.shape}'
 
     # assemble feature points into big A matrix
     # 0, 0, 0, -x, -y, -1,  y'x,  y'y,  y'
@@ -147,7 +148,7 @@ def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor, quite=False)
     o = torch.ones_like(x)
     r0 = torch.cat([z, z, z, -x, -y, -o, yp * x, yp * y, yp], dim=-1)  # N, 9
     r1 = torch.cat([x, y, o, z, z, z, -xp * x, -xp * y, -xp], dim=-1)  # N, 9
-    A = torch.stack([r0, r1], dim=1).view(-1, 9)  # interlased
+    A = torch.stack([r0, r1], dim=-2).view(*sh, -1, 9)  # interlased
 
     U, S, Vh = torch.linalg.svd(A, full_matrices=True)
     V = Vh.mH  # Vh is the conjugate transpose of V
@@ -156,7 +157,7 @@ def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor, quite=False)
         log(f'reprojection error: {colored(f"{S[-1].item():.6f}", "yellow")}')
 
     h = V[:, -1]  # 9, the homography
-    H = h.view(3, 3) / h[-1]  # normalize homography to 1
+    H = h.view(*sh, 3, 3) / h[-1]  # normalize homography to 1
     return H.to(dtype)  # xp = H x
 
 
@@ -410,7 +411,9 @@ def m_estimator(pvt: torch.Tensor, src: torch.Tensor, iter=1000, lr=1e-2, quite=
         if not quite:
             pbar.desc = f'Loss: {loss.item():.8f}'
             pbar.update(1)
-    return homography.detach().requires_grad_(False)
+    homography = homography.detach().requires_grad_(False)
+    homography = homography / homography[..., -1, -1]
+    return homography
 
 
 def parallel_floyd_warshall(distance: torch.Tensor):
@@ -420,18 +423,29 @@ def parallel_floyd_warshall(distance: torch.Tensor):
     # https://saadmahmud14.medium.com/parallel-programming-with-cuda-tutorial-part-4-the-floyd-warshall-algorithm-5e1281c46bf6
     assert distance.shape[-1] == distance.shape[-2], 'Graph matrix should be square'
     V = distance.shape[-1]
-    connect = distance.new_zeros(*distance.shape, V, dtype=torch.bool)
-    # distance = distance.new_full(distance.shape, fill_value=torch.inf)
+    connect = distance.new_full(distance.shape, fill_value=-1, dtype=torch.long)
     for k in range(V):
         connect_with_k = distance[:, k:k + 1].expand(-1, V) + distance[k:k + 1, :].expand(V, -1)
-        not_further_with_k = connect_with_k <= distance  # NOTE: need to contain this equal to get a valid connect matrix
-        distance = torch.where(not_further_with_k, connect_with_k, distance)
-        connect[..., k] = torch.where(not_further_with_k, 1, 0)  # if 1, go to k, else stay put
+        closer_with_k = connect_with_k < distance
+        distance = torch.where(closer_with_k, connect_with_k, distance)
+        connect = torch.where(closer_with_k, k, connect)  # if 1, go to k, else stay put
     return distance, connect  # geodesic distance (closest distance of every pair of element)
 
 
 def magenta(x): return colored(str(x), 'magenta')
 def cyan(x): return colored(str(x), 'cyan')
+
+
+def extract_path_from_connect(i, j, connect) -> List[int]:
+    # https://stackoverflow.com/questions/64163232/how-to-record-the-path-in-this-critical-path-algo-python-floyd-warshall
+    k = connect[i][j]
+    if k == -1:
+        return [i, j]
+    else:
+        path = extract_path_from_connect(i, k, connect)
+        path.pop()  # remove k to avoid duplicates
+        path.extend(extract_path_from_connect(k, j, connect))
+        return path
 
 
 def main():
@@ -445,6 +459,7 @@ def main():
     parser.add_argument('--n_feat', default=10000, type=int)  # otherwise, typically out of memory
     parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typically out of memory
     parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typically out of memory
+    parser.add_argument('--verbose', action='store_true')  # otherwise, typically out of memory
     args = parser.parse_args()
 
     # Loading images from disk and downscale them
@@ -478,7 +493,7 @@ def main():
     # valid: B, B, N indicates whether a match is valid
     # match: B, B, N source image id, target image id, target feature id
     # score: B, B, N matching distance corresponding to matches indicated by match
-    
+
     log(f'Constructing sequential homography on: {colored(f"{args.device}", "cyan")}')
     pivot = pivot if args.pivot < 0 else args.pivot  # use user pivot if defined
     graph = 1 / valid.sum(-1)  # inverse of number of matches
@@ -501,83 +516,72 @@ def main():
     match_map = match_map.detach().cpu().numpy()
     iter_map = iter_map.detach().cpu().numpy()
     ratio_map = ratio_map.detach().cpu().numpy()
+    paths = [[extract_path_from_connect(i, j, connect) for j in range(B)] for i in range(B)]
 
     ret = []  # return values for summary and linear blending
     meta = []
     for source in range(B):
+        log(f'Processing homography pair: {magenta(f"{source:02d}-{pivot:02d}")}')
         # Iterate through all images
         # If pivot, trivially return the original image
         if source == pivot:
-            ret.append([0,  # min_x
-                        0,  # min_y
-                        W,  # max_x
-                        H,  # max_y
-                        imgs[source],
-                        torch.ones_like(imgs[source][0], dtype=torch.bool),
-                        ])
-            meta.append([pivot,
-                         source,
-                         -1,  # cumulated number of matches
-                         -1,  # cumulated RANSAC iteration
-                         -1,  # cumulated inlier ratio
-                         -1,  # number of connections (typically 1)
-                         ]
-                        )
+            ret.append([0, 0, W, H, imgs[source],
+                        torch.ones_like(imgs[source][0], dtype=torch.bool), ])
+            meta.append([pivot, source, -1, -1, -1, -1, []])
             continue
 
         # If not pivot image, do a connected homography to pivot
         # Find the shortest path between src and pvt
-        shortest_path = connect[source, pivot]  # number of jumps from index to pivot
+        shortest_path = paths[source][pivot] # number of jumps from index to pivot
 
         # Find homography transformation from source to pivot of this index
+        cnn = []
         cum = 0
         cum_match = 0
         cum_iter = 0
         cum_ratio = 1.0
         prev = source
-        homography = torch.eye(3, dtype=homographies.dtype, device=homographies.device)  # 3, 3
-        for next, jump in enumerate(shortest_path):
+        cum_homo = torch.eye(3, dtype=homographies.dtype, device=homographies.device)  # 3, 3
+        for next in shortest_path:
             if next == prev: continue  # skip self loop
-            if jump:  # continue to next node if not jumping
-                # Need to find homography if jumping to next node
-                if not visited[prev, next]:
-                    # If not visited, need to find homography
-                    # Find the matches between prev and next
-                    valid_prev_next = valid[prev, next]  # N,
-                    match_prev_next = match[prev, next]  # N, stores matched feature id
+            # Need to find homography if jumping to next node
+            if not visited[prev, next]:
+                # If not visited, need to find homography
+                # Find the matches between prev and next
+                valid_prev_next = valid[prev, next]  # N,
+                match_prev_next = match[prev, next]  # N, stores matched feature id
 
-                    valid_prev_next = valid_prev_next.nonzero()[..., 0]  # M, # MARK: SYNC
-                    match_prev_next = match_prev_next[valid_prev_next]  # M
+                valid_prev_next = valid_prev_next.nonzero()[..., 0]  # M, # MARK: SYNC
+                match_prev_next = match_prev_next[valid_prev_next]  # M
 
-                    src = keypoints2d[prev][valid_prev_next]  # valid match, source image id
-                    pvt = keypoints2d[next][match_prev_next]  # valid match, target image id
+                src = keypoints2d[prev][valid_prev_next]  # valid match, source image id
+                pvt = keypoints2d[next][match_prev_next]  # valid match, target image id
 
-                    src = src / scale  # normalize the images to 0, 1
-                    pvt = pvt / scale  # normalize the images to 0, 1
+                src = src / scale  # normalize the images to 0, 1
+                pvt = pvt / scale  # normalize the images to 0, 1
 
-                    homo, iter, ratio = random_sampling_consensus(pvt, src, quite=True)
-                    homography = homo @ homography  # accumulate homography transform from src to pvt
+                homo, iter, ratio = random_sampling_consensus(pvt, src, quite=not args.verbose)
+                homographies[prev, next] = homo
+                visited[prev, next] = 1
+                match_map[prev, next] = len(src)
+                iter_map[prev, next] = iter
+                ratio_map[prev, next] = ratio
 
-                    homographies[prev, next] = homo
-                    visited[prev, next] = 1
-                    match_map[prev, next] = len(src)
-                    iter_map[prev, next] = iter
-                    ratio_map[prev, next] = ratio
+            # If already visited, just left multiply
+            cum_homo = homographies[prev, next] @ cum_homo
+            cum_match += match_map[prev, next]
+            cum_iter += iter_map[prev, next]
+            cum_ratio *= ratio_map[prev, next]
+            cum += 1
+            cnn.append(next)
 
-                # If already visited, just left multiply
-                homography = homographies[prev, next] @ homography
-                cum_match += match_map[prev, next]
-                cum_iter += iter_map[prev, next]
-                cum_ratio *= ratio_map[prev, next]
-                cum += 1
-
-                # If jumping, prev should updated
-                prev = next
+            # If jumping, prev should updated
+            prev = next
 
         # Apply the constructed homography transformation to get the actual result
-        min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[source], homography)
+        min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[source], cum_homo)
         ret.append([min_x, min_y, max_x, max_y, img, msk, ])
-        meta.append([pivot, source, cum_match, cum_iter, cum_ratio, cum, ])
+        meta.append([pivot, source, cum_match, cum_iter, cum_ratio, cum, cnn])
 
     ret = list(zip(*ret))  # inverted batching
     can_min_x = min(ret[0])
@@ -608,17 +612,17 @@ def main():
 
     # Output some summary for debugging
     log(f'Summary:')
-    for source in range(1, len(meta)):
-        pivot, source, cum_match, cum_iter, cum_ratio, cum = meta[source]
+    for source in range(len(meta)):
+        pivot, source, cum_match, cum_iter, cum_ratio, cum, cnn = meta[source]
         min_x, min_y, max_x, max_y, img, msk = ret[source]
-        log(f'Pair: {magenta(f"{pivot:02d}-{source:02d}")}')
+        log(f'Pair: {magenta(f"{source:02d}-{pivot:02d}")}')
         log(f'-- Number of matches:  {magenta(cum_match)}')
         log(f'-- Upper left corner:  {magenta(f"{min_x-can_min_x}-{min_y-can_min_x}")}')
         log(f'-- Lower right corner: {magenta(f"{max_x-can_min_x}-{max_y-can_min_x}")}')
         log(f'-- Valid pixel region: {magenta(f"{max_x-min_x}-{max_y-min_y}")}')
         log(f'-- Final inlier ratio: {magenta(f"{cum_ratio:.6f}")}')
         log(f'-- RANSAC iteration:   {magenta(cum_iter)}')
-        log(f'-- Connections:        {magenta(cum)}')
+        log(f'-- Connections:        {magenta(cnn)}')
 
 
 if __name__ == "__main__":
