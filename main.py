@@ -125,7 +125,6 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
     # pivot = dist.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
     pivot = valid.sum(-1).sum(-1).argmax().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
 
-
     return pivot, valid, match, score
 
 
@@ -443,6 +442,7 @@ def main():
     down = resize_image_tensor(imgs, args.ratio)
     B, C, H, W = imgs.shape
     B, C, nH, nW = down.shape
+    scale = imgs.new_tensor([W, H])
 
     # Perform feature detection (use kornia implementation)
     log(f'Performing feature detection using: {colored(f"{args.device}", "cyan")}')
@@ -461,26 +461,11 @@ def main():
     # Perform feature matching
     log(f'Performing exhaustive feature matching on: {colored(f"{args.device}", "cyan")}')
     pivot, valid, match, score = feature_matching(desc, args.match_ratio)
-    # match: M, 3 -> image id, source feat id, target feat id
-    # all_match: AM, 4 -> source img id, target img id, source feat id, target feat id
-    # all_score: AM, -> distance of the match described in all_match
+    # pivot: int
+    # valid: B, B, N indicates whether a match is valid
+    # match: B, B, N source image id, target image id, target feature id
+    # score: B, B, N matching distance corresponding to matches indicated by match
 
-    """
-    Sequential homography transform:
-    0. Define a image connection graph, via a adjacency map
-    1. For every image, find the best match in all other images
-    2. Connect these images via match score (sum of inv of all matched dist), higher better
-    3. Check if the graph is connected (war-marshall?)
-    4. If not, add second best matches in the same way as in 2. repeat until full graph is connected
-    5. Or not, just connect them with matching score
-    6. Find shorted distance to connect all images
-    7. Need a manually defined pivot image now?
-    
-    We want an image connectivity list that:
-    1. Is as short as possible in terms of number of images to the pivot
-    2. Contains as much valid matches as possible during the connection process
-    3. We do not want to span a shorted path, instead we just need to get from pivot to source
-    """
     pivot = pivot if args.pivot < 0 else args.pivot  # use user pivot if defined
     graph = 1 / valid.sum(-1).sum(-1)  # inverse of number of matches
     geodesic, connect = parallel_floyd_warshall(graph)  # geodesic distance (closest distance of every pair of element) -> B, B; B, B
@@ -497,29 +482,36 @@ def main():
     connect = connect.detach().cpu().numpy()
 
     ret = []  # return values for summary and linear blending
-    for index in range(B):
+    meta = []
+    for source in range(B):
         # Iterate through all images
         # If pivot, trivially return the original image
-        if index == pivot:
+        if source == pivot:
             ret.append([0,  # min_x
                         0,  # min_y
                         W,  # max_x
                         H,  # max_y
-                        imgs[index],
-                        torch.ones_like(imgs[index], dtype=torch.bool),
-                        -1,  # number of matches
-                        -1,  # RANSAC iter
-                        -1,  # inlier ratio
-                        -1,  # number of connections (typically 1)
+                        imgs[source],
+                        torch.ones_like(imgs[source], dtype=torch.bool),
                         ])
+            meta.append([-1,  # cumulated number of matches
+                         -1,  # cumulated RANSAC iteration
+                         -1,  # cumulated inlier ratio
+                         -1,  # number of connections (typically 1)
+                         ]
+                        )
             continue
 
         # If not pivot image, do a connected homography to pivot
         # Find the shortest path between src and pvt
-        shortest_path = connect[index, pivot]  # number of jumps from index to pivot
+        shortest_path = connect[source, pivot]  # number of jumps from index to pivot
         shortest_length = len(shortest_path)
 
-        prev = index
+        # Find homography transformation from source to pivot of this index
+        cum_match = 0
+        cum_iter = 0
+        cum_ratio = 1.0
+        prev = source
         homography = torch.eye(3, dtype=homographies.dtype, device=homographies.device)  # 3, 3
         for next, jump in enumerate(shortest_path):
             if jump:  # continue to next node if not jumping
@@ -530,78 +522,33 @@ def main():
                 else:
                     # If not visited, need to find homography
                     # Find the matches between prev and next
-                    match_prev_next = match[prev, next] # find matched (from prev to next)
+                    valid_prev_next = valid[prev, next]  # N,
+                    match_prev_next = match[prev, next]  # N, stores matched feature id
+
+                    valid_prev_next = valid_prev_next.nonzero()  # M, # MARK: SYNC
+                    match_prev_next = match_prev_next[valid_prev_next]  # M
+
+                    src = keypoints2d[prev][valid_prev_next]  # valid match, source image id
+                    pvt = keypoints2d[next][match_prev_next]  # valid match, target image id
+
+                    src = src / scale  # normalize the images to 0, 1
+                    pvt = pvt / scale  # normalize the images to 0, 1
+
+                    homo, cum_iter, cum_ratio = ransac_dlt_m_est(pvt, src)
+                    homography = homo @ homography  # accumulate homography transform from src to pvt
+
+                    homographies[prev, next] = homo
                     visited[prev, next] = 1
+                    cum_match += len(src)
+                    cum_iter += cum_iter
+                    cum_ratio *= cum_ratio
                 # If jumping, prev should updated
                 prev = next
 
-    # Visualize feature matching results
-    log(f'Visualizing feature matching results')
-    resp_pivot = resp[pivot:pivot + 1]  # 1, C, 2, 3
-    lafs_pivot = lafs[pivot:pivot + 1]  # 1, C, 2, 3
-    imgs_pivot = imgs[pivot:pivot + 1]  # 1, C, H, W
-    down_pivot = down[pivot:pivot + 1]  # 1, C, nH, nW
-    resp = torch.cat([resp[:pivot], resp[pivot + 1:]])  # B, C, 2, 3
-    lafs = torch.cat([lafs[:pivot], lafs[pivot + 1:]])  # B, C, 2, 3
-    imgs = torch.cat([imgs[:pivot], imgs[pivot + 1:]])  # B, C, H, W
-    down = torch.cat([down[:pivot], down[pivot + 1:]])  # B, C, nH, nW
-    def get_actual_idx(idx, pivot=pivot): return idx if idx < pivot else idx + 1
-    visualize_matches(imgs_pivot,
-                      lafs_pivot,
-                      resp_pivot,
-                      imgs,
-                      lafs,
-                      resp,
-                      _,
-                      [join(args.data_root, args.output_dir, f'match_{pivot:02d}-{get_actual_idx(i):02d}.jpg') for i in range(B)],
-                      pivot,
-                      args.ratio,)
-
-    # Construct matched feature pairs from matching results
-    packed_pivot = pack_laf_into_opencv_fmt(lafs_pivot, resp_pivot)  # 1, N, 4
-    packed = pack_laf_into_opencv_fmt(lafs, resp)  # B-1, N, 4
-    pvt = packed_pivot[0, _[..., 1], :2]  # M, 2, discarding scale, orientation, and response
-    src = packed[_[..., 0], _[..., 2], :2]  # M, 2
-    pairs = torch.cat([_, pvt, src], dim=-1)  # M, 7 -> source image id, source feat id, target feat id, pivot xy, source xy
-    pairs = pairs[torch.argsort(pairs[..., 0])]  # sort pairs by source image id
-    pvt, src = pairs[..., -2 - 2:-2], pairs[..., -2:]  # sorted pairs by source image id, M, 2; M, 2
-
-    # For now, only consider matched points of the first image?
-    uni, inv, cnt, ind = unique_with_indices(pairs[..., 0], sorted=True)
-    meta = []
-    ret = []
-    img = imgs_pivot[0]
-    meta.append([0, 0, 0, 0, 0, 0, 0, 0])  # NOTE: dummy values
-    ret.append([0, 0, W, H, img, torch.ones_like(img[0], dtype=torch.bool)])  # the original image
-    for index, curr, next in zip(uni, ind, torch.cat([ind[1:], ind.new_tensor([len(pairs)])])):
-        index = int(index)  # MARK: SYNC
-        curr = int(curr)  # MARK: SYNC
-        next = int(next)  # MARK: SYNC
-        # next_appearance - first_appearance records the size
-        size = next - curr
-        log(f'Processing image pair: {colored(f"{pivot:02d}-{get_actual_idx(index):02d}", "magenta")}, matches: {colored(f"{size}", "magenta")}')
-        pvt_pair = pvt[curr:next]
-        src_pair = src[curr:next]
-        pvt_pair = pvt_pair / args.ratio  # use original image when stitching
-        src_pair = src_pair / args.ratio  # use original image when stitching
-        meta.append([index, curr, next, size, pivot, get_actual_idx(index)])
-
-        # Normalize pixel coordinates to roughly 0, 1 for a controlled threshold
-        M = max(H, W)
-        pvt_pair[..., 0] = pvt_pair[..., 0] / M
-        pvt_pair[..., 1] = pvt_pair[..., 1] / M
-        src_pair[..., 0] = src_pair[..., 0] / M
-        src_pair[..., 1] = src_pair[..., 1] / M
-
-        # Appply RANSAC and M estimator
-        homography, ransac_iter, inlier_ratio = ransac_dlt_m_est(pvt_pair, src_pair)
-        meta[-1].append(ransac_iter)
-        meta[-1].append(inlier_ratio)
-
-        # homography = discrete_linear_transform(pvt_pair, src_pair)
-        min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[index], homography)
-        save_image(join(args.data_root, args.output_dir, f'trans_{pivot:02d}-{get_actual_idx(index):02d}.jpg'), img.permute(1, 2, 0).detach().cpu().numpy())
-        ret.append([min_x, min_y, max_x, max_y, img, msk])
+        # Apply the constructed homography transformation to get the actual result
+        min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[source], homography)
+        ret.append([min_x, min_y, max_x, max_y, img, msk, ])
+        meta.append([pivot, source, cum_match, cum_iter, cum_ratio, shortest_length, ])
 
     ret = list(zip(*ret))  # inverted batching
     can_min_x = min(ret[0])
@@ -633,16 +580,17 @@ def main():
     # Output some summary for debugging
     def magenta(x): return colored(str(x), 'magenta')
     log(f'Summary:')
-    for index in range(1, len(meta)):
-        index, curr, next, size, pivot, act_idx, ransac_iter, inlier_ratio = meta[index]
-        min_x, min_y, max_x, max_y, img, msk = ret[index]
-        log(f'Pair: {magenta(f"{pivot:02d}-{act_idx:02d}")}')
-        log(f'-- Number of matches:  {magenta(size)}')
+    for source in range(1, len(meta)):
+        pivot, source, cum_match, cum_iter, cum_ratio, shortest_length = meta[source]
+        min_x, min_y, max_x, max_y, img, msk = ret[source]
+        log(f'Pair: {magenta(f"{pivot:02d}-{source:02d}")}')
+        log(f'-- Number of matches:  {magenta(cum_match)}')
         log(f'-- Upper left corner:  {magenta(f"{min_x-can_min_x}-{min_y-can_min_x}")}')
         log(f'-- Lower right corner: {magenta(f"{max_x-can_min_x}-{max_y-can_min_x}")}')
         log(f'-- Valid pixel region: {magenta(f"{max_x-min_x}-{max_y-min_y}")}')
-        log(f'-- Final inlier ratio: {magenta(f"{inlier_ratio:.6f}")}')
-        log(f'-- RANSAC iteration:   {magenta(ransac_iter)}')
+        log(f'-- Final inlier ratio: {magenta(f"{cum_ratio:.6f}")}')
+        log(f'-- RANSAC iteration:   {magenta(cum_iter)}')
+        log(f'-- Connections:        {magenta(shortest_length)}')
 
 
 if __name__ == "__main__":
