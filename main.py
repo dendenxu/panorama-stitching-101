@@ -315,7 +315,7 @@ def ransac_dlt_m_est(pvt: torch.Tensor,
                      min_sample: int = 4,
                      inlier_iter: int = 100,
                      inlier_crit: float = 1e-5,
-                     confidence: float = 1 - 1e-6,
+                     confidence: float = 1 - 1e-5,
                      max_iter: int = 10000,
                      m_repeat: int = 2,  # repeat m-estimator 10 times
                      ):
@@ -364,7 +364,7 @@ def ransac_dlt_m_est(pvt: torch.Tensor,
     ransac_iter = i
     inlier_ratio = max_ratio
 
-    # return discrete_linear_transform(pvt_inliers, src_inliers)
+    # return discrete_linear_transform(pvt_inliers, src_inliers).to(dtype), ransac_iter, inlier_ratio
     for i in range(m_repeat):
         homography = m_estimator(pvt_inliers, src_inliers)
 
@@ -427,9 +427,9 @@ def main():
     parser.add_argument('--output_dir', default='output')
     parser.add_argument('--ext', default='.JPG')
     parser.add_argument('--device', default='cuda')
-    parser.add_argument('--n_feat', default=5000, type=int)  # otherwise, typically out of memory
+    parser.add_argument('--n_feat', default=10000, type=int)  # otherwise, typically out of memory
     parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typically out of memory
-    parser.add_argument('--match_ratio', default=0.25, type=float)  # otherwise, typically out of memory
+    parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typically out of memory
     args = parser.parse_args()
 
     # Loading images from disk and downscale them
@@ -553,7 +553,7 @@ def main():
         y = min_y - can_min_y
         canvas[..., y:y + img.shape[1], x:x + img.shape[2]] += img
         accumu[..., y:y + img.shape[1], x:x + img.shape[2]] += msk
-    canvas = canvas / accumu.clip(1e-6)
+    canvas = canvas / accumu.clip(1e-6) * (accumu > 0)
 
     result_path = join(args.data_root, args.output_dir, 'canvas.jpg')
     save_image(result_path, canvas.permute(1, 2, 0).detach().cpu().numpy())
