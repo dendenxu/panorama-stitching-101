@@ -30,7 +30,7 @@ traceback.install()
 
 
 class FeatureDetector(nn.Module):
-    def __init__(self, PS=41, n_features=1000) -> None:
+    def __init__(self, PS=41, n_features=10000, descriptor=SIFTDescriptor(41, rootsift=True)) -> None:
         super().__init__()
         self.PS = PS
         self.n_features = n_features
@@ -48,7 +48,7 @@ class FeatureDetector(nn.Module):
                                            ori_module=self.ori,
                                            mr_size=6.0,
                                            minima_are_also_good=True)
-        self.descriptor = SIFTDescriptor(PS, rootsift=True)
+        self.descriptor = descriptor
 
     def forward(self, gray: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if gray.shape[1] == 3:  # rgb:
@@ -60,16 +60,14 @@ class FeatureDetector(nn.Module):
         # Descriptor accepts standard tensor [B, CH, H, W], while patches are [B, N, CH, H, W] shape
         # So we need to reshape a bit :)
         descs = self.descriptor(patches.view(B * N, CH, H, W)).view(B, N, -1)
-        # scores, matches = kornia.feature.match_snn(descs[0], descs[1], 0.9)
         return lafs, descs, resps
 
 
 def resize_image_tensor(imgs: torch.Tensor, ratio: float):
     B, C, H, W = imgs.shape
     nH, nW = int(H * ratio), int(W * ratio)
-    # assert int(nH * ratio) == H and int(nW * ratio) == W, 'resizing ratio should be exact for easy inversion'
     imgs = F.interpolate(imgs, (nH, nW), mode='area')
-    return imgs
+    return imgs, nH, nW
 
 
 def pack_laf_into_opencv_fmt(lafs: torch.Tensor, resp: torch.Tensor):
@@ -81,31 +79,23 @@ def pack_laf_into_opencv_fmt(lafs: torch.Tensor, resp: torch.Tensor):
     return packed
 
 
-def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+def exhaustive_feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
     # B, B, N, N -> every image pair, every distance pair -> 36 * 500 * 500 * 128 * 4 / 2**20 MB
     # half of memory and computation wasted
     B, N, C = desc.shape
-    # pvt = desc[:, None, :, None, :]
-    # src =  desc[None, :, None, :, :]
-    # ssd = (pvt - src).pow(2).sum(-1).sqrt()  # BBNN sum of squared error, diagonal values should be ignored
     pvt = desc[:, None].expand(B, B, N, C).reshape(B * B, N, C)
     src = desc[None, :].expand(B, B, N, C).reshape(B * B, N, C)
-    # ssd = torch.cdist(pvt, src, compute_mode='donot_use_mm_for_euclid_dist').view(B, B, N, N)  # some numeric error here?
     device = desc.device
     dtype = desc.dtype
-    # pvt = pvt.cpu()
-    # src = src.cpu()
     pvt = pvt.double()
     src = src.double()
     ssd = torch.cdist(pvt, src).view(B, B, N, N).to(dtype)  # some numeric error here?
-    # ssd = torch.cdist(pvt, src, compute_mode='donot_use_mm_for_euclid_dist').view(B, B, N, N)  # some numeric error here?
 
     # Find the one with cloest match to other images as the pivot (# ? not scalable?)
     min2, match = ssd.cpu().topk(2, dim=-1, largest=False)  # find closest distance
     min2, match = min2.to(device, non_blocking=True), match.to(device, non_blocking=True)
     match: torch.Tensor = match[..., 0]  # only the largest value correspond to dist B, B, N, cloest is on diagonal
     score: torch.Tensor = min2[..., 0] / min2[..., 1].clip(1e-6)  # unambiguous match should have low distance here B, B, N,
-    # dist = min2[..., 0]  # ambiguous matches also present B, B, N,
 
     # Find actual two-way matching results
     reversed = (torch.zeros_like(match) - 1).scatter_(dim=-1, index=match.permute(1, 0, 2), src=torch.arange(N, device=match.device, dtype=match.dtype)[None, None].expand(B, B, N))  # valid index, B, B, N
@@ -117,23 +107,24 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
     # actual ratio: (1 - 1 / B) * match_ratio
     match_ratio = (1 - 1 / B) * match_ratio + 1 / B
     threshold = score.ravel().topk(int(score.numel() * (1 - match_ratio))).values.min()  # the ratio used to discard unmatched values
-    # threshold = match_ratio
     log(f'Thresholding matches with: {colored(f"{threshold:.6f}", "yellow")}')
 
     valid = score <= threshold  # number of matches per image? B, B, N
     valid = valid & two_way_match  # need a two way matching to make this work?
     pivot = score.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
-    # pivot = valid.sum(-1).sum(-1).argmax().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
 
     return pivot, valid, match, score
 
 
 def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor, quite=False) -> torch.Tensor:
-    # given feature point pairs, solve them with DLT algorithm
-    # pvt: N, 2 # the x prime vector
-    # src: N, 2 # the x vector
-    dtype = pvt.dtype
+    # Given feature point pairs, solve them with DLT algorithm
+    # Supports multiple batch dimensions
+    # pvt: *sh, N, 2 # the x prime vector
+    # src: *sh, N, 2 # the x vector
     sh = pvt.shape[:-2]
+
+    # Type conversion for accuracy
+    dtype = pvt.dtype
     pvt = pvt.double()
     src = src.double()  # otherwise would be numerically instable
 
@@ -146,8 +137,8 @@ def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor, quite=False)
     xp, yp = pvt.chunk(2, dim=-1)
     z = torch.zeros_like(x)
     o = torch.ones_like(x)
-    r0 = torch.cat([z, z, z, -x, -y, -o, yp * x, yp * y, yp], dim=-1)  # N, 9
-    r1 = torch.cat([x, y, o, z, z, z, -xp * x, -xp * y, -xp], dim=-1)  # N, 9
+    r0 = torch.cat([z, z, z, -x, -y, -o, yp * x, yp * y, yp], dim=-1)  # *sh, N, 9
+    r1 = torch.cat([x, y, o, z, z, z, -xp * x, -xp * y, -xp], dim=-1)  # *sh, N, 9
     A = torch.stack([r0, r1], dim=-2).view(*sh, -1, 9)  # interlased
 
     U, S, Vh = torch.linalg.svd(A, full_matrices=True)
@@ -156,12 +147,16 @@ def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor, quite=False)
     if not quite:
         log(f'reprojection error: {colored(f"{S[-1].item():.6f}", "yellow")}')
 
-    h = V[:, -1]  # 9, the homography
-    H = h.view(*sh, 3, 3) / h[-1]  # normalize homography to 1
-    return H.to(dtype)  # xp = H x
+    h = V[..., -1]  # *sh, 9, the homography
+    H = h.view(*sh, 3, 3) / h[..., -1]  # normalize homography to 1
+
+    # Type conversion for accuracy
+    H = H.to(dtype)  # xp = H x
+    return H
 
 
 def unique_with_indices(x: torch.Tensor, sorted=False, dim=-1):
+    # TODO: fix this
     if sorted:
         unique, inverse, counts = torch.unique_consecutive(x, dim=dim, return_inverse=True, return_counts=True)
     else:
@@ -176,10 +171,11 @@ def unique_with_indices(x: torch.Tensor, sorted=False, dim=-1):
 def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     # blends two images with homography transform
     # determine the final size of the blended image to construct a canvas
-    # pvt: 3, H, W
-    # src: 3, H, W
-    # homography: 3, 3
-    C, H, W = img.shape
+    # pvt: *sh, 3, H, W
+    # src: *sh, 3, H, W
+    # homography: *sh, 3, 3
+    sh = img.shape[:-3]
+    C, H, W = img.shape[-3:]
     scale = img.new_tensor([W, H])
 
     # straight lines will always map to straight lines
@@ -188,15 +184,15 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
         [0, H, 1],
         [W, 0, 1],
         [W, H, 1],
-    ])  # 4, 3
+    ])[(None,) * len(sh)].expand(*sh, 4, 3)  # 4, 3
     corners[..., :-1] = corners[..., :-1] / scale  # normalization
-    corners = corners @ homography.mT  # 4, 3
+    corners = corners @ homography.mT  # *sh, 4, 3
     corners = corners[..., :-1] / corners[..., -1:]  # 4, 3 / 4, 1 -> x, y pixels
     corners = corners * scale  # renormalize pixel coordinates
-    min_corner = corners.min(dim=0)[0]  # x, y for min value
-    max_corner = corners.max(dim=0)[0]  # x, y for max value
-    min_x, min_y = int(min_corner[0].floor().item()), int(min_corner[1].floor().item())  # MARK: SYNC
-    max_x, max_y = int(max_corner[0].ceil().item()), int(max_corner[1].ceil().item())  # MARK: SYNC
+    min_corner = corners.min(dim=-2)[0]  # x, y for min value
+    max_corner = corners.max(dim=-2)[0]  # x, y for max value
+    min_x, min_y = int(min_corner[..., 0].floor().item()), int(min_corner[..., 1].floor().item())  # MARK: SYNC
+    max_x, max_y = int(max_corner[..., 0].ceil().item()), int(max_corner[..., 1].ceil().item())  # MARK: SYNC
     src_W, src_H = max_x - min_x, max_y - min_y
 
     # Calculate the pixel coodinates
@@ -204,7 +200,7 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
                           torch.arange(src_W, dtype=img.dtype, device=img.device),
                           indexing='ij')  # H, W
     # 0->H, 0->W
-    xy1 = torch.stack([j, i, torch.ones_like(i)], dim=-1)  # mH, mW, 3
+    xy1 = torch.stack([j, i, torch.ones_like(i)], dim=-1)[(None,) * len(sh)].expand(*sh, -1, -1, 3)  # mH, mW, 3
     xy1[..., :2] = xy1[..., :2] + min_corner  # shift to origin
     xy1[..., :2] = xy1[..., :2] / scale  # renormalize to 0, 1
     xy1 = xy1 @ homography.inverse().mT  # mH, mW, 3
@@ -212,7 +208,7 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     xy = xy * 2 - 1  # normalized to -1, 1, mH, mW, 2
 
     # Sampled pixel values
-    img = F.grid_sample(img[None], xy[None], align_corners=False, padding_mode='zeros', mode='bilinear')[0]  # 3, mH, mW
+    img = F.grid_sample(img.view(-1, *img.shape[-3:]), xy.view(-1, *xy.shape[-3:]), align_corners=False, padding_mode='zeros', mode='bilinear').view(*sh, img.shape[-3], *xy.shape[-3:-1])  # 3, mH, mW
 
     # Valid pixel values
     msk = (xy >= -1).all(-1) & (xy <= 1).all(-1)  # both x and y need to meet crit
@@ -221,6 +217,7 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
 
 
 def visualize_detection(imgs: torch.Tensor, lafs: torch.Tensor, resp: torch.Tensor, paths: List[str], ratio=1.0):
+    # TODO: fix this
     pack = pack_laf_into_opencv_fmt(lafs, resp)  # B, N, 4
     pack[..., :2] = pack[..., :2] / ratio
     imgs = imgs.permute(0, 2, 3, 1)  # B, H, W, C
@@ -311,10 +308,11 @@ def random_sampling_consensus(pvt: torch.Tensor,
                               m_repeat: int = 2,  # repeat m-estimator 10 times
                               quite=False,
                               ):
-    N, C = pvt.shape
+    # Type conversion for accuracy
     dtype = pvt.dtype
     src = src.double()
     pvt = pvt.double()
+    N, C = pvt.shape
 
     max_ratio = 0
     best_fit = None
@@ -382,10 +380,14 @@ def random_sampling_consensus(pvt: torch.Tensor,
             log(f'Iter: {colored(f"{i}", "magenta")}')
             log(f'Inlier ratio: {colored(f"{ratio:.6f}", "green")}')
             log(f'Max inlier ratio: {colored(f"{max_ratio:.6f}", "green")}')
-    return best_fit.to(dtype), ransac_iter, inlier_ratio
+
+    # Type conversion for accuracy
+    best_fit = best_fit.to(dtype)
+    return best_fit, ransac_iter, inlier_ratio
 
 
 def apply_homography(src: torch.Tensor, homography: torch.Tensor):
+    # Apply homography transformation (2d or 3d, batched or not)
     src = torch.cat([src, torch.ones_like(src[..., -1:])], dim=-1)
     pvt = src @ homography.mT
     pvt = pvt[..., :-1] / pvt[..., -1:]
@@ -393,6 +395,12 @@ def apply_homography(src: torch.Tensor, homography: torch.Tensor):
 
 
 def m_estimator(pvt: torch.Tensor, src: torch.Tensor, iter=1000, lr=1e-2, quite=False):
+    # Type conversion for accuracy
+    dtype = pvt.dtype
+    pvt = pvt.double()
+    src = src.double()
+
+    # Apply m estimator to DLT, non-linear optimization using PyTorch
     def rou(error: torch.Tensor, sigma=1):
         squared = error ** 2
         return squared / (squared + sigma ** 2)
@@ -404,6 +412,7 @@ def m_estimator(pvt: torch.Tensor, src: torch.Tensor, iter=1000, lr=1e-2, quite=
         loss = loss.mean()
         return loss
 
+    # Initialization with DLT algo (no iteration needed)
     homography = discrete_linear_transform(pvt, src, quite=quite)  # initialization
     homography.requires_grad_()
     optim = torch.optim.Adam([homography], lr=lr)
@@ -418,8 +427,13 @@ def m_estimator(pvt: torch.Tensor, src: torch.Tensor, iter=1000, lr=1e-2, quite=
         if not quite:
             pbar.desc = f'Loss: {loss.item():.8f}'
             pbar.update(1)
+
+    # Normalization to make values look good
     homography = homography.detach().requires_grad_(False)
     homography = homography / homography[..., -1, -1]
+
+    # Type conversion for accuracy
+    homography = homography.to(dtype)
     return homography
 
 
@@ -430,6 +444,8 @@ def parallel_floyd_warshall(distance: torch.Tensor):
     # https://saadmahmud14.medium.com/parallel-programming-with-cuda-tutorial-part-4-the-floyd-warshall-algorithm-5e1281c46bf6
     assert distance.shape[-1] == distance.shape[-2], 'Graph matrix should be square'
     V = distance.shape[-1]
+
+    # Connection matrix, later used for extracting shortest path
     connect = distance.new_full(distance.shape, fill_value=-1, dtype=torch.long)
     for k in range(V):
         connect_with_k = distance[:, k:k + 1].expand(-1, V) + distance[k:k + 1, :].expand(V, -1)
@@ -437,10 +453,6 @@ def parallel_floyd_warshall(distance: torch.Tensor):
         distance = torch.where(closer_with_k, connect_with_k, distance)
         connect = torch.where(closer_with_k, k, connect)  # if 1, go to k, else stay put
     return distance, connect  # geodesic distance (closest distance of every pair of element)
-
-
-def magenta(x): return colored(str(x), 'magenta')
-def cyan(x): return colored(str(x), 'cyan')
 
 
 def extract_path_from_connect(i, j, connect) -> List[int]:
@@ -469,15 +481,20 @@ def main():
     parser.add_argument('--verbose', action='store_true')  # otherwise, typically out of memory
     args = parser.parse_args()
 
+    # Some utility functions
+    def magenta(x): return colored(str(x), 'magenta')
+    def cyan(x): return colored(str(x), 'cyan')
+    def pretty_list(x): return '[' + ', '.join([f'{f:.4f}' for f in x]) + ']'
+
     # Loading images from disk and downscale them
     log(f'Loading images from: {cyan(args.data_root)}')
     imgs = sorted(glob(join(args.data_root, f'*{args.ext}')))
     imgs = list_to_tensor(parallel_execution(imgs, action=load_image), args.device)  # rgb images: B, C, H, W
     # imgs = imgs.double()
-    down = resize_image_tensor(imgs, args.ratio)
+    down, nH, nW = resize_image_tensor(imgs, args.ratio)
     B, C, H, W = imgs.shape
-    B, C, nH, nW = down.shape
     scale = imgs.new_tensor([W, H])
+    args.ratio = imgs.new_tensor([nW / W, nH / H])
 
     # Perform feature detection (use kornia implementation)
     log(f'Performing feature detection using: {colored(f"{args.device}", "cyan")}')
@@ -495,7 +512,7 @@ def main():
 
     # Perform feature matching
     log(f'Performing exhaustive feature matching on: {colored(f"{args.device}", "cyan")}')
-    pivot, valid, match, score = feature_matching(desc, args.match_ratio)
+    pivot, valid, match, score = exhaustive_feature_matching(desc, args.match_ratio)
     # pivot: int
     # valid: B, B, N indicates whether a match is valid
     # match: B, B, N source image id, target image id, target feature id
@@ -509,9 +526,9 @@ def main():
 
     # Find location of 2d keypoints
     keypoints2d = get_laf_center(lafs)  # B, N, 2
-    keypoints2d = keypoints2d / args.ratio # restore ratio
+    keypoints2d = keypoints2d / args.ratio  # restore ratio
 
-    # Define the matrix of homography
+    # Define the matrix of homography & other reused components in 2d map # ? memory
     homographies = keypoints2d.new_zeros(B, B, 3, 3)  # to be filled with actual homography
     visited = connect.new_zeros(B, B, dtype=torch.bool)  # zero indicateds not visited
     match_map = connect.new_zeros(B, B, dtype=torch.long)
@@ -527,8 +544,8 @@ def main():
     paths = [[extract_path_from_connect(i, j, connect) for j in range(B)] for i in range(B)]
 
     # Perform sequential homographic matching & transformation
-    ret = []  # return values for summary and linear blending
-    meta = []
+    ret = []  # return values for linear blending
+    meta = []  # return values for summary (some meta-info)
     for source in range(B):
         log(f'Processing homography pair: {magenta(f"{source:02d}-{pivot:02d}")}')
         # Iterate through all images
@@ -536,7 +553,7 @@ def main():
         if source == pivot:
             ret.append([0, 0, W, H, imgs[source],
                         torch.ones_like(imgs[source][0], dtype=torch.bool), ])
-            meta.append([source, pivot, -1, -1, -1, -1, []])
+            meta.append([source, pivot, -1, -1, -1, -1, [], torch.eye(3, dtype=homographies.dtype, device=homographies.device)])
             continue
 
         # If not pivot image, do a connected homography to pivot
@@ -578,6 +595,7 @@ def main():
 
             # If already visited, just left multiply
             cum_homo = homographies[prev, next] @ cum_homo
+            cum_homo = cum_homo / cum_homo[..., -1, -1]
             cum_match += match_map[prev, next]
             cum_iter += iter_map[prev, next]
             cum_ratio *= ratio_map[prev, next]
@@ -585,10 +603,12 @@ def main():
 
             # If jumping, prev should updated
             prev = next
+
         # Apply the constructed homography transformation to get the actual result
+        log(f'Applying homography: {magenta(pretty_list(cum_homo.ravel().tolist()))}')
         min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[source], cum_homo)
         ret.append([min_x, min_y, max_x, max_y, img, msk, ])
-        meta.append([source, pivot, cum_match, cum_iter, cum_ratio, cum, shortest_path])
+        meta.append([source, pivot, cum_match, cum_iter, cum_ratio, cum, shortest_path, cum_homo])
 
     ret = list(zip(*ret))  # inverted batching
     can_min_x = min(ret[0])
@@ -610,7 +630,7 @@ def main():
         y = min_y - can_min_y
         canvas[..., y:y + img.shape[1], x:x + img.shape[2]] += img
         accumu[..., y:y + img.shape[1], x:x + img.shape[2]] += msk
-    canvas = canvas / accumu.clip(1e-6) * (accumu > 0)
+    canvas = canvas / accumu.clip(1e-6) * (accumu > 0)  # naive linear blending
 
     # Save the blended image to disk for visualization
     result_path = join(args.data_root, args.output_dir, 'canvas.jpg')
@@ -620,7 +640,7 @@ def main():
     # Output some summary for debugging
     log(f'Summary:')
     for source in range(len(meta)):
-        source, pivot, cum_match, cum_iter, cum_ratio, cum, shortest_path = meta[source]
+        source, pivot, cum_match, cum_iter, cum_ratio, cum, shortest_path, cum_homo = meta[source]
         min_x, min_y, max_x, max_y, img, msk = ret[source]
         log(f'Pair: {magenta(f"{source:02d}-{pivot:02d}")}')
         log(f'-- Number of matches:  {magenta(cum_match)}')
@@ -630,6 +650,7 @@ def main():
         log(f'-- Final inlier ratio: {magenta(f"{cum_ratio:.6f}")}')
         log(f'-- RANSAC iteration:   {magenta(cum_iter)}')
         log(f'-- Best connection:    {magenta(shortest_path)}')
+        log(f'-- Homography matrix:  {magenta(pretty_list(cum_homo.ravel().tolist()))}')
 
 
 if __name__ == "__main__":
