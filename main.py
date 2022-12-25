@@ -104,7 +104,7 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
     min2, match = ssd.cpu().topk(2, dim=-1, largest=False)  # find closest distance
     min2, match = min2.to(device, non_blocking=True), match.to(device, non_blocking=True)
     match: torch.Tensor = match[..., 0]  # only the largest value correspond to dist B, N, cloest is on diagonal
-    dist: torch.Tensor = min2[..., 0] / min2[..., 1]  # unambiguous match should have low distance here B, B, N,
+    dist: torch.Tensor = min2[..., 0] / min2[..., 1].clip(1e-6)  # unambiguous match should have low distance here B, B, N,
     # dist = min2[..., 0]  # ambiguous matches also present B, B, N,
 
     # Find actual two-way matching results
@@ -112,8 +112,12 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
     two_way_match = match == reversed  # B, B, N
 
     # Select valid threshold -> might not be wise to batch since every image pair is different...
-    # threshold = dist.ravel().topk(int(dist.numel() * (1 - match_ratio))).values.min()  # the ratio used to discard unmatched values
-    threshold = match_ratio
+    # total: B * B * N
+    # dummy: B * N
+    # actual ratio: (1 - 1 / B) * match_ratio
+    match_ratio = (1 - 1 / B) * match_ratio + 1 / B
+    threshold = dist.ravel().topk(int(dist.numel() * (1 - match_ratio))).values.min()  # the ratio used to discard unmatched values
+    # threshold = match_ratio
     log(f'Thresholding matches with: {colored(f"{threshold:.6f}", "yellow")}')
 
     matched = dist <= threshold  # number of matches per image? B, B, N
@@ -189,7 +193,7 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
         [W, 0, 1],
         [W, H, 1],
     ])  # 4, 3
-    corners[..., :-1] = corners[..., :-1] / M # normalization
+    corners[..., :-1] = corners[..., :-1] / M  # normalization
     corners = corners @ homography.mT  # 4, 3
     corners = corners[..., :-1] / corners[..., -1:]  # 4, 3 / 4, 1 -> x, y pixels
     corners = corners * M  # renormalize pixel coordinates
@@ -210,7 +214,7 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     xy1 = xy1 @ torch.inverse(homography).mT  # mH, mW, 3
     xy = xy1[..., :-1] / xy1[..., -1:]  # mH, mW, 3 / mH, mW, 1 -> x, y pixels
     xy = xy * M
-    xy = xy / xy.new_tensor([W, H]) # renormalization according to H and W since sampling requires strict -1, 1
+    xy = xy / xy.new_tensor([W, H])  # renormalization according to H and W since sampling requires strict -1, 1
     xy = xy * 2 - 1  # normalized to -1, 1, mH, mW, 2
 
     # Sampled pixel values
@@ -306,12 +310,16 @@ def ransac_dlt_m_est(pvt: torch.Tensor,
                      min_sample: int = 4,
                      inlier_iter: int = 100,
                      inlier_crit: float = 1e-5,
-                     confidence: float = 1 - 1e-5,
+                     confidence: float = 1 - 1e-6,
                      max_iter: int = 10000,
                      m_repeat: int = 2,  # repeat m-estimator 10 times
                      ):
     N, C = pvt.shape
     # rand_ind = np.random.choice(N, size=(inlier_iter, min_sample))
+    dtype = pvt.dtype
+    src = src.double()
+    pvt = pvt.double()
+
     max_ratio = 0
     best_fit = None
     pvt_inliers = None
@@ -347,6 +355,10 @@ def ransac_dlt_m_est(pvt: torch.Tensor,
         if i >= min_iter:
             break
         i += 1
+
+    ransac_iter = i
+    inlier_ratio = max_ratio
+
     # return discrete_linear_transform(pvt_inliers, src_inliers)
     for i in range(m_repeat):
         homography = m_estimator(pvt_inliers, src_inliers)
@@ -366,7 +378,7 @@ def ransac_dlt_m_est(pvt: torch.Tensor,
         log(f'Iter: {colored(f"{i}", "magenta")}')
         log(f'Inlier ratio: {colored(f"{ratio:.6f}", "green")}')
         log(f'Max inlier ratio: {colored(f"{max_ratio:.6f}", "green")}')
-    return best_fit
+    return best_fit.to(dtype), ransac_iter, inlier_ratio
 
 
 def apply_homography(src: torch.Tensor, homography: torch.Tensor):
@@ -412,7 +424,7 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--n_feat', default=5000, type=int)  # otherwise, typically out of memory
     parser.add_argument('--ratio', default=0.5, type=float)  # otherwise, typically out of memory
-    parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typically out of memory
+    parser.add_argument('--match_ratio', default=0.25, type=float)  # otherwise, typically out of memory
     args = parser.parse_args()
 
     # Loading images from disk and downscale them
@@ -480,8 +492,10 @@ def main():
     uni, inv, cnt, ind = unique_with_indices(pairs[..., 0], sorted=True)
 
     # For now, only consider matched points of the first image?
+    meta = []
     ret = []
     img = imgs_pivot[0]
+    meta.append([0, 0, 0, 0, 0, 0, 0, 0]) # NOTE: dummy values
     ret.append([0, 0, W, H, img, torch.ones_like(img[0], dtype=torch.bool)])  # the original image
     for idx, curr, next in zip(uni, ind, torch.cat([ind[1:], ind.new_tensor([len(pairs)])])):
         idx = int(idx)  # MARK: SYNC
@@ -494,6 +508,7 @@ def main():
         src_pair = src[curr:next]
         pvt_pair = pvt_pair / args.ratio  # use original image when stitching
         src_pair = src_pair / args.ratio  # use original image when stitching
+        meta.append([idx, curr, next, size, pivot, get_actual_idx(idx)])
 
         # Normalize pixel coordinates to roughly 0, 1 for a controlled threshold
         M = max(H, W)
@@ -503,7 +518,9 @@ def main():
         src_pair[..., 1] = src_pair[..., 1] / M
 
         # Appply RANSAC and M estimator
-        homography = ransac_dlt_m_est(pvt_pair, src_pair)
+        homography, ransac_iter, inlier_ratio = ransac_dlt_m_est(pvt_pair, src_pair)
+        meta[-1].append(ransac_iter)
+        meta[-1].append(inlier_ratio)
 
         # homography = discrete_linear_transform(pvt_pair, src_pair)
         min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[idx], homography)
@@ -525,14 +542,31 @@ def main():
 
     # Linear blending for now (excess memory usage?)
     log(f'Performing linear blending image stitching on: {colored(f"{args.device}", "cyan")}')
-    for min_x, min_y, max_x, max_y, img, msk in zip(*ret):
+    ret = list(zip(*ret))
+    for min_x, min_y, max_x, max_y, img, msk in ret:
         x = min_x - can_min_x
         y = min_y - can_min_y
         canvas[..., y:y + img.shape[1], x:x + img.shape[2]] += img
         accumu[..., y:y + img.shape[1], x:x + img.shape[2]] += msk
     canvas = canvas / accumu.clip(1e-6)
 
-    save_image(join(args.data_root, args.output_dir, 'canvas.jpg'), canvas.permute(1, 2, 0).detach().cpu().numpy())
+    result_path = join(args.data_root, args.output_dir, 'canvas.jpg')
+    save_image(result_path, canvas.permute(1, 2, 0).detach().cpu().numpy())
+    log(f'Blended result saved to: {result_path}')
+
+    # Output some summary for debugging
+    def magenta(x): return colored(str(x), 'magenta')
+    log(f'Summary:')
+    for i in range(1, len(meta)):
+        idx, curr, next, size, pivot, act_idx, ransac_iter, inlier_ratio = meta[i]
+        min_x, min_y, max_x, max_y, img, msk = ret[i]
+        log(f'Pair: {magenta(f"{pivot:02d}-{act_idx:02d}")}')
+        log(f'-- Number of matches:  {magenta(size)}')
+        log(f'-- Upper left corner:  {magenta(f"{min_x-can_min_x}-{min_y-can_min_x}")}')
+        log(f'-- Lower right corner: {magenta(f"{max_x-can_min_x}-{max_y-can_min_x}")}')
+        log(f'-- Valid pixel region: {magenta(f"{max_x-min_x}-{max_y-min_y}")}')
+        log(f'-- Final inlier ratio: {magenta(f"{inlier_ratio:.6f}")}')
+        log(f'-- RANSAC iteration:   {magenta(ransac_iter)}')
 
 
 if __name__ == "__main__":
