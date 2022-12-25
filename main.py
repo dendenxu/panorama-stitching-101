@@ -92,11 +92,12 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
     src = desc[None, :].expand(B, B, N, C).reshape(B * B, N, C)
     # ssd = torch.cdist(pvt, src, compute_mode='donot_use_mm_for_euclid_dist').view(B, B, N, N)  # some numeric error here?
     device = desc.device
+    dtype = desc.dtype
     # pvt = pvt.cpu()
     # src = src.cpu()
     pvt = pvt.double()
     src = src.double()
-    ssd = torch.cdist(pvt, src).view(B, B, N, N).float()  # some numeric error here?
+    ssd = torch.cdist(pvt, src).view(B, B, N, N).to(dtype)  # some numeric error here?
     # ssd = torch.cdist(pvt, src, compute_mode='donot_use_mm_for_euclid_dist').view(B, B, N, N)  # some numeric error here?
 
     # Find the one with cloest match to other images as the pivot (# ? not scalable?)
@@ -184,10 +185,11 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     # straight lines will always map to straight lines
     corners = img.new_tensor([
         [0, 0, 1],
-        [0, H / M, 1],
-        [W / M, 0, 1],
-        [W / M, H / M, 1],
+        [0, H, 1],
+        [W, 0, 1],
+        [W, H, 1],
     ])  # 4, 3
+    corners[..., :-1] = corners[..., :-1] / M # normalization
     corners = corners @ homography.mT  # 4, 3
     corners = corners[..., :-1] / corners[..., -1:]  # 4, 3 / 4, 1 -> x, y pixels
     corners = corners * M  # renormalize pixel coordinates
@@ -206,7 +208,9 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     xy1[..., :2] = xy1[..., :2] + min_corner  # shift to origin
     xy1[..., :2] = xy1[..., :2] / M
     xy1 = xy1 @ torch.inverse(homography).mT  # mH, mW, 3
-    xy = xy1[..., :2] / xy1[..., -1:]  # mH, mW, 3 / mH, mW, 1 -> x, y pixels
+    xy = xy1[..., :-1] / xy1[..., -1:]  # mH, mW, 3 / mH, mW, 1 -> x, y pixels
+    xy = xy * M
+    xy = xy / xy.new_tensor([W, H]) # renormalization according to H and W since sampling requires strict -1, 1
     xy = xy * 2 - 1  # normalized to -1, 1, mH, mW, 2
 
     # Sampled pixel values
@@ -301,8 +305,8 @@ def ransac_dlt_m_est(pvt: torch.Tensor,
                      src: torch.Tensor,
                      min_sample: int = 4,
                      inlier_iter: int = 100,
-                     inlier_crit: float = 1e-6,
-                     confidence: float = 1 - 1e-6,
+                     inlier_crit: float = 1e-5,
+                     confidence: float = 1 - 1e-5,
                      max_iter: int = 10000,
                      m_repeat: int = 2,  # repeat m-estimator 10 times
                      ):
@@ -408,13 +412,14 @@ def main():
     parser.add_argument('--device', default='cuda')
     parser.add_argument('--n_feat', default=5000, type=int)  # otherwise, typically out of memory
     parser.add_argument('--ratio', default=0.5, type=float)  # otherwise, typically out of memory
-    parser.add_argument('--match_ratio', default=0.8, type=float)  # otherwise, typically out of memory
+    parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typically out of memory
     args = parser.parse_args()
 
     # Loading images from disk and downscale them
     log(f'Loading images from: {args.data_root}')
     imgs = sorted(glob(join(args.data_root, f'*{args.ext}')))
     imgs = list_to_tensor(parallel_execution(imgs, action=load_image), args.device)  # rgb images: B, C, H, W
+    # imgs = imgs.double()
     down = resize_image_tensor(imgs, args.ratio)
     B, C, H, W = imgs.shape
     B, C, nH, nW = down.shape
