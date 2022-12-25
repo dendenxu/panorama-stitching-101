@@ -296,6 +296,7 @@ def ransac_dlt_m_est(pvt: torch.Tensor,
                      inlier_crit: float = 0.0001,
                      confidence: float = 0.9999,
                      max_iter: int = 10000,
+                     m_repeat: int = 5,  # repeat m-estimator 10 times
                      ):
     N, C = pvt.shape
     # rand_ind = np.random.choice(N, size=(inlier_iter, min_sample))
@@ -324,18 +325,36 @@ def ransac_dlt_m_est(pvt: torch.Tensor,
             pvt_inliers = pvt[crit]  # MARK: SYNC
             src_inliers = src[crit]  # MARK: SYNC
         min_iter = find_min_iter(max_ratio, confidence, min_sample)
-        min_iter = min(min_iter, inlier_iter)
-        log(f'ransac random sampling:')
-        log(f'iter: {colored(f"{i}", "magenta")}')
-        log(f'min iter: {colored(f"{min_iter}", "magenta")}')
-        log(f'remaining iter: {colored(f"{min_iter - i}", "magenta")}')
-        log(f'inlier ratio: {colored(f"{ratio:.6f}", "green")}')
-        log(f'max inlier ratio: {colored(f"{max_ratio:.6f}", "green")}')
+        min_iter = max(min_iter, inlier_iter)
+        log(f'RANSAC random sampling:')
+        log(f'Iter: {colored(f"{i}", "magenta")}')
+        log(f'Min iter: {colored(f"{min_iter}", "magenta")}')
+        log(f'Remaining iter: {colored(f"{min_iter - i}", "magenta")}')
+        log(f'Inlier ratio: {colored(f"{ratio:.6f}", "green")}')
+        log(f'Max inlier ratio: {colored(f"{max_ratio:.6f}", "green")}')
         if i >= min_iter:
             break
         i += 1
     # return discrete_linear_transform(pvt_inliers, src_inliers)
-    return m_estimator(pvt_inliers, src_inliers)
+    for i in range(m_repeat):
+        homography = m_estimator(pvt_inliers, src_inliers)
+
+        # Apply homography for linear error estimation
+        pred = apply_homography(src, homography)
+        # Find ratio of inlier
+        crit = (pred - pvt).pow(2).sum(-1)
+        crit = crit < inlier_crit  # SSD critical threshold
+        ratio = crit.sum().item() / crit.numel()  # MARK: SYNC
+        if ratio > max_ratio:
+            max_ratio = ratio
+            best_fit = homography
+            pvt_inliers = pvt[crit]  # MARK: SYNC
+            src_inliers = src[crit]  # MARK: SYNC
+        log(f'M-estimator repeatation:')
+        log(f'Iter: {colored(f"{i}", "magenta")}')
+        log(f'Inlier ratio: {colored(f"{ratio:.6f}", "green")}')
+        log(f'Max inlier ratio: {colored(f"{max_ratio:.6f}", "green")}')
+    return best_fit
 
 
 def apply_homography(src: torch.Tensor, homography: torch.Tensor):
@@ -381,7 +400,7 @@ def main():
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--n_feat', default=1000, type=int)  # otherwise, typicall out of memory
     parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typicall out of memory
-    parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typically out of memory
+    parser.add_argument('--match_ratio', default=0.98, type=float)  # otherwise, typically out of memory
     args = parser.parse_args()
 
     # Loading images from disk and downscale them
@@ -393,7 +412,7 @@ def main():
     B, C, nH, nW = down.shape
 
     # Perform feature detection (use kornia implementation)
-    log(f'Performing feature detection using: {args.device}')
+    log(f'Performing feature detection using: {colored(f"{args.device}", "cyan")}')
     feature_detector = FeatureDetector(n_features=args.n_feat).to(args.device, non_blocking=True)  # the actual feature detector
     with torch.no_grad():
         lafs, desc, resp = feature_detector(down)  # B, N, 128 -> batch size, number of descs, desc dimensionality
@@ -407,7 +426,7 @@ def main():
                         args.ratio)
 
     # Perform feature matching
-    log(f'Performing exhaustive feature matching on: {args.device}')
+    log(f'Performing exhaustive feature matching on: {colored(f"{args.device}", "cyan")}')
     pivot, match = feature_matching(desc, args.match_ratio)  # M, 3 -> image id, source feat id, target feat id
 
     # Visualize feature matching results
@@ -486,11 +505,13 @@ def main():
     can_max_y = max(ret[3])
     can_W = can_max_x - can_min_x  # canvas size
     can_H = can_max_y - can_min_y  # canvas size
+    log(f'Canvas size: {colored(f"{can_H}, {can_W}", "magenta")}')
 
     canvas = torch.zeros((3, can_H, can_W), dtype=torch.float, device=args.device)
     accumu = torch.zeros((1, can_H, can_W), dtype=torch.float, device=args.device)
 
     # Linear blending for now (excess memory usage?)
+    log(f'Performing linear blending image stitching on: {colored(f"{args.device}", "cyan")}')
     for min_x, min_y, max_x, max_y, img, msk in zip(*ret):
         x = min_x - can_min_x
         y = min_y - can_min_y
