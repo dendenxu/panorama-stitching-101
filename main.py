@@ -532,7 +532,7 @@ def main():
 
         # If not pivot image, do a connected homography to pivot
         # Find the shortest path between src and pvt
-        shortest_path = paths[source][pivot] # number of jumps from index to pivot
+        shortest_path = paths[source][pivot]  # number of jumps from index to pivot
 
         # Find homography transformation from source to pivot of this index
         cnn = []
