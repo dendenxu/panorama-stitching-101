@@ -122,8 +122,8 @@ def feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, 
 
     valid = score <= threshold  # number of matches per image? B, B, N
     valid = valid & two_way_match  # need a two way matching to make this work?
-    # pivot = dist.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
-    pivot = valid.sum(-1).sum(-1).argmax().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
+    pivot = score.sum(-1).sum(-1).argmin().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
+    # pivot = valid.sum(-1).sum(-1).argmax().item()  # find the pivot image to use (diagonal trivially ignored) # MARK: SYNC
 
     return pivot, valid, match, score
 
@@ -206,8 +206,8 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     # 0->H, 0->W
     xy1 = torch.stack([j, i, torch.ones_like(i)], dim=-1)  # mH, mW, 3
     xy1[..., :2] = xy1[..., :2] + min_corner  # shift to origin
-    xy1[..., :2] = xy1[..., :2] / scale
-    xy1 = xy1 @ torch.inverse(homography).mT  # mH, mW, 3
+    xy1[..., :2] = xy1[..., :2] / scale  # renormalize to 0, 1
+    xy1 = xy1 @ homography.inverse().mT  # mH, mW, 3
     xy = xy1[..., :-1] / xy1[..., -1:]  # mH, mW, 3 / mH, mW, 1 -> x, y pixels
     xy = xy * 2 - 1  # normalized to -1, 1, mH, mW, 2
 
@@ -244,6 +244,7 @@ def visualize_matches(imgs_pivot: torch.Tensor,
                       paths: List[str],
                       pivot: int,
                       ratio=1.0):
+    # TODO: fix this...
     pack_pivot = pack_laf_into_opencv_fmt(lafs_pivot, resp_pivot)  # B, N, 4
     pack_pivot[..., :2] = pack_pivot[..., :2] / ratio
     imgs_pivot = imgs_pivot.permute(0, 2, 3, 1)  # B, H, W, C
@@ -293,6 +294,7 @@ def visualize_matches(imgs_pivot: torch.Tensor,
         match_1to2[match[curr:next, 1]] = match[curr:next]
         matches1to2 = [cv2.DMatch(m[1], m[2], m[0], 0) for m in match_1to2]
 
+        # Draw matches visualization on canvas image
         canvas = np.zeros([H, 2 * W, 3])
         canvas = cv2.drawMatches(img_pivot, kps_pivot, img, kps, matches1to2, canvas, matchesMask=match_mask, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)  # weird...
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -310,7 +312,6 @@ def random_sampling_consensus(pvt: torch.Tensor,
                               quite=False,
                               ):
     N, C = pvt.shape
-    # rand_ind = np.random.choice(N, size=(inlier_iter, min_sample))
     dtype = pvt.dtype
     src = src.double()
     pvt = pvt.double()
@@ -321,15 +322,17 @@ def random_sampling_consensus(pvt: torch.Tensor,
     src_inliers = None
     def find_min_iter(inlier_ratio, confidence, min_sample): return int(np.ceil(np.log(1 - confidence) / np.log(1 - inlier_ratio**min_sample)))
 
-    # for i, rand in zip(range(inlier_iter), rand_ind):
     i = 0
     while i < max_iter:
+        # Randomly sample min_sample data points
         rand = np.random.choice(N, size=(min_sample), replace=False)
         pvt_rand = pvt[rand]
         src_rand = src[rand]
-        homography = discrete_linear_transform(pvt_rand, src_rand, quite=quite)
+
         # Apply homography for linear error estimation
+        homography = discrete_linear_transform(pvt_rand, src_rand, quite=quite)
         pred = apply_homography(src, homography)
+
         # Find ratio of inlier
         crit = (pred - pvt).pow(2).sum(-1)
         crit = crit < inlier_crit  # SSD critical threshold
@@ -339,6 +342,8 @@ def random_sampling_consensus(pvt: torch.Tensor,
             best_fit = homography
             pvt_inliers = pvt[crit]  # MARK: SYNC
             src_inliers = src[crit]  # MARK: SYNC
+
+        # Determine whether to continue
         min_iter = find_min_iter(max_ratio, confidence, min_sample)
         min_iter = max(min_iter, inlier_iter)
         if not quite:
@@ -357,10 +362,10 @@ def random_sampling_consensus(pvt: torch.Tensor,
 
     # return discrete_linear_transform(pvt_inliers, src_inliers).to(dtype), ransac_iter, inlier_ratio
     for i in range(m_repeat):
-        homography = m_estimator(pvt_inliers, src_inliers, quite=quite)
-
         # Apply homography for linear error estimation
+        homography = m_estimator(pvt_inliers, src_inliers, quite=quite)
         pred = apply_homography(src, homography)
+
         # Find ratio of inlier
         crit = (pred - pvt).pow(2).sum(-1)
         crit = crit < inlier_crit  # SSD critical threshold
@@ -370,6 +375,8 @@ def random_sampling_consensus(pvt: torch.Tensor,
             best_fit = homography
             pvt_inliers = pvt[crit]  # MARK: SYNC
             src_inliers = src[crit]  # MARK: SYNC
+
+        # Annouce the result
         if not quite:
             log(f'M-estimator repeatation:')
             log(f'Iter: {colored(f"{i}", "magenta")}')
@@ -502,6 +509,7 @@ def main():
 
     # Find location of 2d keypoints
     keypoints2d = get_laf_center(lafs)  # B, N, 2
+    keypoints2d = keypoints2d / args.ratio # restore ratio
 
     # Define the matrix of homography
     homographies = keypoints2d.new_zeros(B, B, 3, 3)  # to be filled with actual homography
@@ -518,6 +526,7 @@ def main():
     ratio_map = ratio_map.detach().cpu().numpy()
     paths = [[extract_path_from_connect(i, j, connect) for j in range(B)] for i in range(B)]
 
+    # Perform sequential homographic matching & transformation
     ret = []  # return values for summary and linear blending
     meta = []
     for source in range(B):
@@ -527,7 +536,7 @@ def main():
         if source == pivot:
             ret.append([0, 0, W, H, imgs[source],
                         torch.ones_like(imgs[source][0], dtype=torch.bool), ])
-            meta.append([pivot, source, -1, -1, -1, -1, []])
+            meta.append([source, pivot, -1, -1, -1, -1, []])
             continue
 
         # If not pivot image, do a connected homography to pivot
@@ -546,22 +555,23 @@ def main():
             # Need to find homography if jumping to next node
             if not visited[prev, next]:
                 # If not visited, need to find homography
+
                 # Find the matches between prev and next
                 valid_prev_next = valid[prev, next]  # N,
                 match_prev_next = match[prev, next]  # N, stores matched feature id
-
                 valid_prev_next = valid_prev_next.nonzero()[..., 0]  # M, # MARK: SYNC
-                match_prev_next = match_prev_next[valid_prev_next]  # M
-
-                src = keypoints2d[prev][valid_prev_next]  # valid match, source image id
-                pvt = keypoints2d[next][match_prev_next]  # valid match, target image id
-
+                match_prev_next = match_prev_next[valid_prev_next]  # M, valid matches target
+                src = keypoints2d[prev][valid_prev_next]  # valid match, source image id, kps
+                pvt = keypoints2d[next][match_prev_next]  # valid match, target image id, kps
                 src = src / scale  # normalize the images to 0, 1
                 pvt = pvt / scale  # normalize the images to 0, 1
 
+                # Perform RANSAC
                 homo, iter, ratio = random_sampling_consensus(pvt, src, quite=not args.verbose)
-                homographies[prev, next] = homo
+
+                # Prepare results
                 visited[prev, next] = 1
+                homographies[prev, next] = homo
                 match_map[prev, next] = len(src)
                 iter_map[prev, next] = iter
                 ratio_map[prev, next] = ratio
@@ -575,11 +585,10 @@ def main():
 
             # If jumping, prev should updated
             prev = next
-
         # Apply the constructed homography transformation to get the actual result
         min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[source], cum_homo)
         ret.append([min_x, min_y, max_x, max_y, img, msk, ])
-        meta.append([pivot, source, cum_match, cum_iter, cum_ratio, cum, shortest_path])
+        meta.append([source, pivot, cum_match, cum_iter, cum_ratio, cum, shortest_path])
 
     ret = list(zip(*ret))  # inverted batching
     can_min_x = min(ret[0])
@@ -611,7 +620,7 @@ def main():
     # Output some summary for debugging
     log(f'Summary:')
     for source in range(len(meta)):
-        pivot, source, cum_match, cum_iter, cum_ratio, cum, shortest_path = meta[source]
+        source, pivot, cum_match, cum_iter, cum_ratio, cum, shortest_path = meta[source]
         min_x, min_y, max_x, max_y, img, msk = ret[source]
         log(f'Pair: {magenta(f"{source:02d}-{pivot:02d}")}')
         log(f'-- Number of matches:  {magenta(cum_match)}')
