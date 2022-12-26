@@ -121,7 +121,7 @@ def chunkify(chunk_size=8, key='img', pos=0, dim=0):  # TODO: apply this to all 
     return wrapper
 
 
-def exhaustive_feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+def exhaustive_feature_matching(desc: torch.Tensor, match_ratio: float = .7, cdist_device='cuda') -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
     # B, B, N, N -> every image pair, every distance pair -> 36 * 500 * 500 * 128 * 4 / 2**20 MB
     B, N, C = desc.shape
     device = desc.device
@@ -130,11 +130,11 @@ def exhaustive_feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> 
 
     # Type conversion for numerical stability
     dtype = desc.dtype
-    pvt = pvt.double()
-    src = src.double()
+    pvt = pvt.double().to(cdist_device, non_blocking=True)
+    src = src.double().to(cdist_device, non_blocking=True)
 
-    # Need to chunk this to avoid OOM
-    chunk_size = int(np.floor((3 * 3 * 5000 * 5000) / (N * N)))
+    # Need to chunk this to avoid OOM # Edit: just compute cdist on CPU...
+    chunk_size = int(np.floor((2 * 2 * 5000 * 5000) / (N * N)))
     @chunkify(chunk_size=chunk_size)
     def chunked_cdist(x, y): return torch.cdist(x, y)
     ssd = chunked_cdist(pvt, src)
@@ -144,7 +144,7 @@ def exhaustive_feature_matching(desc: torch.Tensor, match_ratio: float = .7) -> 
     ssd = ssd.to(dtype)  # some numeric error here?
 
     # Find the one with cloest match to other images as the pivot (# ? not scalable?)
-    min2, match = ssd.cpu().topk(2, dim=-1, largest=False)  # find closest distance
+    min2, match = ssd.topk(2, dim=-1, largest=False)  # find closest distance
     min2, match = min2.to(device, non_blocking=True), match.to(device, non_blocking=True)
     match: torch.Tensor = match[..., 0]  # only the largest value correspond to dist B, B, N, cloest is on diagonal
     score: torch.Tensor = min2[..., 0] / min2[..., 1].clip(1e-6)  # unambiguous match should have low distance here B, B, N,
@@ -207,19 +207,6 @@ def discrete_linear_transform(pvt: torch.Tensor, src: torch.Tensor, quite=False)
     return H
 
 
-def unique_with_indices(x: torch.Tensor, sorted=False, dim=-1):
-    # TODO: fix this
-    if sorted:
-        unique, inverse, counts = torch.unique_consecutive(x, dim=dim, return_inverse=True, return_counts=True)
-    else:
-        unique, inverse, counts = torch.unique(x, dim=dim, sorted=True, return_inverse=True, return_counts=True)
-    _, ind_sorted = torch.sort(inverse, stable=True)
-    cum_sum: torch.Tensor = counts.cumsum(0)
-    cum_sum = torch.cat((torch.tensor([0], device=cum_sum.device, dtype=cum_sum.dtype), cum_sum[:-1]))
-    indices = ind_sorted[cum_sum]
-    return unique, inverse, counts, indices
-
-
 def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     # blends two images with homography transform
     # determine the final size of the blended image to construct a canvas
@@ -269,85 +256,72 @@ def homography_transform(img: torch.Tensor, homography: torch.Tensor):
     return min_x, min_y, max_x, max_y, img, msk
 
 
-def visualize_detection(imgs: torch.Tensor, lafs: torch.Tensor, resp: torch.Tensor, paths: List[str], ratio=1.0):
+def visualize_detection(imgs: torch.Tensor,
+                        lafs: torch.Tensor,
+                        resp: torch.Tensor,
+                        outdir: str,
+                        ratio=1.0):
     pack = pack_laf_into_opencv_fmt(lafs, resp)  # B, N, 4
     pack[..., :2] = pack[..., :2] / ratio
     imgs = imgs.permute(0, 2, 3, 1)  # B, H, W, C
-    imgs = imgs.detach().cpu().numpy()
-    pack = pack.detach().cpu().numpy()
-    for path, img, kps in zip(paths, imgs, pack):
+    imgs: np.ndarray = imgs.detach().cpu().numpy()
+    pack: np.ndarray = pack.detach().cpu().numpy()
+    os.makedirs(outdir, exist_ok=True)
+    for i, img, kps in zip(range(len(imgs)), imgs, pack):
         img = (img.clip(0, 1) * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
         kps = [cv2.KeyPoint(*d) for d in kps]
         img = cv2.drawKeypoints(img, kps, img, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        path = join(outdir, f'detect{i:02d}.jpg')
         cv2.imwrite(path, img)
 
 
-def visualize_matches(imgs_pivot: torch.Tensor,
-                      lafs_pivot: torch.Tensor,
-                      resp_pivot: torch.Tensor,
-                      imgs: torch.Tensor,
-                      lafs: torch.Tensor,
-                      resp: torch.Tensor,
-                      match: torch.Tensor,  # M, 3
-                      paths: List[str],
-                      pivot: int,
-                      ratio=1.0):
-    # TODO: fix this...
-    pack_pivot = pack_laf_into_opencv_fmt(lafs_pivot, resp_pivot)  # B, N, 4
-    pack_pivot[..., :2] = pack_pivot[..., :2] / ratio
-    imgs_pivot = imgs_pivot.permute(0, 2, 3, 1)  # B, H, W, C
-    imgs_pivot = imgs_pivot.detach().cpu().numpy()
-    pack_pivot = pack_pivot.detach().cpu().numpy()
-
-    pack = pack_laf_into_opencv_fmt(lafs, resp)  # B, N, 4
+def visualize_matching(imgs: torch.Tensor,  # B, H, W, 3
+                       lafs: torch.Tensor,  # B, N, 2, 3
+                       resp: torch.Tensor,  # B, N,
+                       valid: torch.Tensor,  # B, B, N
+                       match: torch.Tensor,  # B, B, N
+                       outdir: str,
+                       ratio=1.0):
+    B, H, W, C = imgs.shape
+    B, N = resp.shape
+    os.makedirs(outdir, exist_ok=True)
+    pack = pack_laf_into_opencv_fmt(lafs, resp)
     pack[..., :2] = pack[..., :2] / ratio
     imgs = imgs.permute(0, 2, 3, 1)  # B, H, W, C
-    imgs = imgs.detach().cpu().numpy()
-    pack = pack.detach().cpu().numpy()
-    _, H, W, C = imgs.shape
+    imgs: np.ndarray = imgs.detach().cpu().numpy()
+    pack: np.ndarray = pack.detach().cpu().numpy()
+    resp: np.ndarray = resp.detach().cpu().numpy()
+    valid: np.ndarray = valid.detach().cpu().numpy()
+    match: np.ndarray = match.detach().cpu().numpy()
+    for prev in range(B):
+        for next in range(B):
 
-    img_pivot = imgs_pivot[0]  # H, W, 3
-    img_pivot = (img_pivot.clip(0, 1) * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
-    kps_pivot = pack_pivot[0]  # N, 4
-    kps_pivot = [cv2.KeyPoint(*d) for d in kps_pivot]
+            # Find the matches between prev and next
+            valid_prev_next: np.ndarray = valid[prev, next]  # N,
+            match_prev_next: np.ndarray = match[prev, next]  # N, stores matched feature id
+            valid_prev_next: np.ndarray = valid_prev_next.nonzero()[0]  # M,
+            match_prev_next: np.ndarray = match_prev_next[valid_prev_next]  # M, valid matches target
 
-    match = match[match[..., 0].argsort()]  # sort by image id
-    uni, _, _, ind = unique_with_indices(match[..., 0], sorted=True)
+            # Get target values
+            img_prev = imgs[prev]
+            img_next = imgs[next]
+            kps_prev = pack[prev]  # source, M,
+            kps_next = pack[next]  # pivot, M,
 
-    # From now on, use numpy instead of tensors since we're writing output
-    uni = uni.detach().cpu().numpy()
-    ind = ind.detach().cpu().numpy()
-    match = match.detach().cpu().numpy()
+            # Prepare source and pivot images
+            img_prev = (img_prev.clip(0, 1) * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
+            img_next = (img_next.clip(0, 1) * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
+            kps_prev = [cv2.KeyPoint(*d) for d in kps_prev]  # M,
+            kps_next = [cv2.KeyPoint(*d) for d in kps_next]  # M,
 
-    # For now, only consider matched points of the first image?
-    def get_actual_idx(idx, pivot=pivot): return idx if idx < pivot else idx + 1
-    for idx, curr, next in zip(uni, ind, np.concatenate([ind[1:], np.array([len(match)])])):
-        idx = int(idx)
-        curr = int(curr)
-        next = int(next)
-        size = next - curr
-        log(f'Visualizing image pair: {colored(f"{pivot:02d}-{get_actual_idx(idx):02d}", "magenta")}, matches: {colored(f"{size}", "magenta")}')
+            # Prepare matching parameters
+            matches1to2 = [cv2.DMatch(s, p, 0, 0) for s, p in zip(valid_prev_next, match_prev_next)]
 
-        # Prepare source images
-        path = paths[idx]
-        img = imgs[idx]
-        kps = pack[idx]
-        img = (img.clip(0, 1) * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
-        kps = [cv2.KeyPoint(*d) for d in kps]
-
-        # Prepare matching parameters
-        match_mask = np.zeros(len(kps_pivot), dtype=np.uint8)
-        match_mask[match[curr:next, 1]] = 1  # pivot selection
-        match_1to2 = np.zeros((len(kps_pivot), 3), dtype=np.uint8)
-        match_1to2[match[curr:next, 1]] = match[curr:next]
-        matches1to2 = [cv2.DMatch(m[1], m[2], m[0], 0) for m in match_1to2]
-
-        # Draw matches visualization on canvas image
-        canvas = np.zeros([H, 2 * W, 3])
-        canvas = cv2.drawMatches(img_pivot, kps_pivot, img, kps, matches1to2, canvas, matchesMask=match_mask, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)  # weird...
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        cv2.imwrite(path, canvas)
+            # Draw matches visualization on canvas image
+            canvas = np.zeros([H, 2 * W, 3])
+            canvas = cv2.drawMatches(img_prev, kps_prev, img_next, kps_next, matches1to2, canvas, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)  # weird...
+            path = join(outdir, f'match{prev:02d}-{next:02d}.jpg')
+            cv2.imwrite(path, canvas)
 
 
 def random_sampling_consensus(pvt: torch.Tensor,
@@ -526,11 +500,13 @@ def main():
     parser.add_argument('--output_dir', default='output')
     parser.add_argument('--ext', default='.JPG')
     parser.add_argument('--device', default='cuda')
+    parser.add_argument('--cdist_device', default='cpu')
     parser.add_argument('--pivot', default=-1, type=int)
     parser.add_argument('--n_feat', default=5000, type=int)  # otherwise, typically out of memory
     parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typically out of memory
     parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typically out of memory
     parser.add_argument('--verbose', action='store_true')  # otherwise, typically out of memory
+    parser.add_argument('--visualize', action='store_true')  # visualize detection and matching results
     args = parser.parse_args()
 
     # Some utility functions
@@ -548,7 +524,7 @@ def main():
     args.ratio = imgs.new_tensor([nW / W, nH / H])
 
     # Perform feature detection (use kornia implementation)
-    log(f'Performing feature detection using: {colored(f"{args.device}", "cyan")}')
+    log(f'Performing feature detection on: {colored(f"{args.device}", "cyan")}')
     feature_detector = FeatureDetector(n_features=args.n_feat).to(args.device, non_blocking=True)  # the actual feature detector
     with torch.no_grad():
         chunk_size = int(np.floor((8 * 3 * 1024 * 1024) / (C * nH * nW)))
@@ -557,17 +533,24 @@ def main():
         lafs, desc, resp = chunked_feature_detector(down)  # B, N, 128 -> batch size, number of descs, desc dimensionality
 
     # Visualize feature detection results as images
-    log(f'Visualizing detected feature at: {cyan(join(args.data_root, args.output_dir))}')
-    paths = [join(args.data_root, args.output_dir, f'detect_{i:02d}.jpg') for i in range(B)]
-    visualize_detection(imgs, lafs, resp, paths, args.ratio)
+    if args.visualize:
+        outdir = join(args.data_root, args.output_dir, "detect")
+        log(f'Visualizing detected feature at: {cyan(outdir)}')
+        visualize_detection(imgs, lafs, resp, outdir, args.ratio)
 
     # Perform feature matching
-    log(f'Performing exhaustive feature matching on: {colored(f"{args.device}", "cyan")}')
-    pivot, valid, match, score = exhaustive_feature_matching(desc, args.match_ratio)
+    log(f'Performing exhaustive feature matching on: {colored(f"{args.device}", "cyan")} and {colored(f"{args.cdist_device}", "cyan")}')
+    pivot, valid, match, score = exhaustive_feature_matching(desc, args.match_ratio, args.cdist_device)
     # pivot: int, pivot image proposition
     # valid: B, B, N indicates whether a match is valid
     # match: B, B, N source image id, target image id, target feature id
     # score: B, B, N matching distance corresponding to matches indicated by match
+
+    # Visualize feature matching results
+    if args.visualize:
+        outdir = join(args.data_root, args.output_dir, "match")
+        log(f'Visualizing matched feature at: {cyan(join(args.data_root, args.output_dir))}')
+        visualize_matching(imgs, lafs, resp, valid, match, outdir, args.ratio)
 
     log(f'Constructing sequential homography on: {colored(f"{args.device}", "cyan")}')
     pivot = pivot if args.pivot < 0 else args.pivot  # use user pivot if defined
@@ -684,7 +667,7 @@ def main():
     canvas = canvas / accumu.clip(1e-6) * (accumu > 0)  # naive linear blending
 
     # Save the blended image to disk for visualization
-    result_path = join(args.data_root, args.output_dir, 'canvas.jpg')
+    result_path = join(args.data_root, args.output_dir, 'blended.jpg')
     save_image(result_path, canvas.permute(1, 2, 0).detach().cpu().numpy())
     log(f'Blended result saved to: {cyan(result_path)}')
 
