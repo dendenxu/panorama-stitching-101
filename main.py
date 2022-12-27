@@ -339,9 +339,9 @@ def random_sampling_consensus(pvt: torch.Tensor,
                               src: torch.Tensor,
                               min_sample: int = 4,
                               min_iter: int = 100,
+                              max_iter: int = 10000,
                               threshold: float = 1e-5,
                               confidence: float = 1 - 1e-5,
-                              max_iter: int = 10000,
                               m_repeat: int = 2,  # repeat m-estimator 10 times
                               quite=False,
                               ):
@@ -379,16 +379,16 @@ def random_sampling_consensus(pvt: torch.Tensor,
             src_inliers = src[crit]  # MARK: SYNC
 
         # Determine whether to continue
-        min_iter = find_min_iter(max_ratio, confidence, min_sample)
-        min_iter = max(min_iter, min_iter)
+        exp_min_iter = find_min_iter(max_ratio, confidence, min_sample)
+        target_iter = max(min_iter, exp_min_iter)
         if not quite:
             log(f'RANSAC random sampling:')
             log(f'Iter: {colored(f"{i}", "magenta")}')
-            log(f'Min iter: {colored(f"{min_iter}", "magenta")}')
-            log(f'Remaining iter: {colored(f"{min_iter - i}", "magenta")}')
+            log(f'Min iter: {colored(f"{target_iter}", "magenta")}')
+            log(f'Remaining iter: {colored(f"{target_iter - i}", "magenta")}')
             log(f'Inlier ratio: {colored(f"{ratio:.6f}", "green")}')
             log(f'Max inlier ratio: {colored(f"{max_ratio:.6f}", "green")}')
-        if i >= min_iter:
+        if i >= target_iter:
             break
         i += 1
 
@@ -420,7 +420,7 @@ def random_sampling_consensus(pvt: torch.Tensor,
 
     # Type conversion for accuracy
     best_fit = best_fit.to(dtype)
-    return best_fit, ransac_iter, min_iter, inlier_ratio
+    return best_fit, ransac_iter, exp_min_iter, inlier_ratio
 
 
 def apply_homography(src: torch.Tensor, homography: torch.Tensor):
