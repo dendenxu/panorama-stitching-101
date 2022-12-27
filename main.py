@@ -29,6 +29,12 @@ traceback.install()
 # Lets define some functions for local feature matching
 
 
+class PixelDescriptor(nn.Module):
+    def forward(self, patches):
+        # patches: B, CH, H, W
+        return patches.view(patches.shape[0], -1)  # simply concatenate all pixel values
+
+
 class FeatureDetector(nn.Module):
     def __init__(self, PS=41, n_features=10000, descriptor=SIFTDescriptor(41, rootsift=True)) -> None:
         super().__init__()
@@ -496,16 +502,34 @@ def extract_path_from_connect(i, j, connect) -> List[int]:
 def main():
     # Commandline Arguments
     parser = argparse.ArgumentParser()
+
+    # Data options
     parser.add_argument('--data_root', default='data/data1')
     parser.add_argument('--output_dir', default='output')
     parser.add_argument('--ext', default='.JPG')
-    parser.add_argument('--device', default='cuda')
-    parser.add_argument('--cdist_device', default='cpu')
     parser.add_argument('--pivot', default=-1, type=int)
+
+    # General device selection (some part of the algorithm will always run on CPU)
+    parser.add_argument('--device', default='cuda')  # you can also specifi something like cuda:1
+
+    # Feature detector options
     parser.add_argument('--n_feat', default=5000, type=int)  # otherwise, typically out of memory
+    parser.add_argument('--desc_type', default='sift', choices=['sift', 'pixel'])
+
+    # Matching options
+    parser.add_argument('--cdist_device', default='cpu')  # you can also specifi something like cuda:1
     parser.add_argument('--ratio', default=1.0, type=float)  # otherwise, typically out of memory
     parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typically out of memory
-    parser.add_argument('--verbose', action='store_true')  # otherwise, typically out of memory
+
+    # RANSAC options
+    parser.add_argument('--ransac_min_iter', type=int, default=100, help='min number of iterations to run for RANSAC before determining covergence')
+    parser.add_argument('--ransac_max_iter', type=int, default=10000, help='max number of iterations to run for RANSAC')
+    parser.add_argument('--ransac_threshold', type=float, default=1e-5, help='threshold for RANSAC to determine if a point is an inlier')
+    parser.add_argument('--ransac_confidence', type=float, default=1 - 1e-5, help='the target probability for RANSAC to succeed')
+    parser.add_argument('--m_estimator_repeat', type=int, default=2, help='number of times to repeat the m_estimator after performing RANSAC')
+
+    # Misc options
+    parser.add_argument('--verbose', action='store_true')
     parser.add_argument('--visualize', action='store_true')  # visualize detection and matching results
     args = parser.parse_args()
 
@@ -525,7 +549,13 @@ def main():
 
     # Perform feature detection (use kornia implementation)
     log(f'Performing feature detection on: {colored(f"{args.device}", "cyan")}')
-    feature_detector = FeatureDetector(n_features=args.n_feat).to(args.device, non_blocking=True)  # the actual feature detector
+    descriptor_factory = {
+        'sift': SIFTDescriptor,
+        'pixel': PixelDescriptor,
+    }
+    descriptor = descriptor_factory[args.desc_type]()  # initialize the actual feature detector
+    feature_detector = FeatureDetector(n_features=args.n_feat, descriptor=descriptor)
+    feature_detector.to(args.device, non_blocking=True)  # the actual feature detector
     with torch.no_grad():
         chunk_size = int(np.floor((8 * 3 * 1024 * 1024) / (C * nH * nW)))
         @chunkify(chunk_size=chunk_size)
