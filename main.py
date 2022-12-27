@@ -527,7 +527,7 @@ def main():
     parser.add_argument('--match_ratio', default=0.9, type=float)  # otherwise, typically out of memory
 
     # RANSAC options
-    parser.add_argument('--ransac_min_iter', type=int, default=100, help='min number of iterations to run for RANSAC before determining covergence')
+    parser.add_argument('--ransac_min_iter', type=int, default=10, help='min number of iterations to run for RANSAC before determining covergence')
     parser.add_argument('--ransac_max_iter', type=int, default=10000, help='max number of iterations to run for RANSAC')
     parser.add_argument('--ransac_threshold', type=float, default=1e-5, help='threshold for RANSAC to determine if a point is an inlier')
     parser.add_argument('--ransac_confidence', type=float, default=1 - 1e-5, help='the target probability for RANSAC to succeed')

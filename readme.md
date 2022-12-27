@@ -19,6 +19,8 @@ Then we go on to propose a new graph shortest path based sequential homography m
 
 We are not sure whether such algorithm exist in literature due to limited knowledge of the author, however we do implement it and it seem to work much better than selecting on pivot image and match every other ones on it.
 
+We evaluate the performance of our algorithm on 4 sets of images. Note that the number of images in the provided dataset is quite small (3-5 images). We also provide a comparison between the SIFT descriptor and concatenated pixel descriptor, analysing their respective influence on the number of RANSAC iterations.
+
 ## Method
 
 ## Implementation Details
