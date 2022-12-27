@@ -23,7 +23,30 @@ We evaluate the performance of our algorithm on 4 sets of images. Note that the 
 
 ## Method
 
+### Feature Detection and Descriptor
+
+For feature detector, we adopted [kornia's implementation of SIFT detector](https://github.com/kornia/kornia-examples/blob/master/image-matching-example.ipynb) by constructing a `ScaleSpaceDetector`. We chunk the images before feeding them to the feature detector to avoid running out of memory by a heuristic batch size. Note that to retain parallelism, we extract a fixed number of features for each image (typically 5000). After feature detection, we perform feature extraction with the user selected feature descriptor.
+
+-   For SIFT, we use the `SIFTDescriptor` class provided by [kornia](https://github.com/kornia/kornia).
+-   For pixel concatenation descriptor, we simply aggregate all pixel values of a patch by concatenation to form its descriptor.
+
+It's worth noting that this concatenation is merely for the **descriptor**, both SIFT and pixel concantenation use the same SIFT **detector** thus we don't expect to see any difference in the detected features.
+
+### Feature Matching
+
+We implement an naive exhaustive feature matching technique by utilizing the `cdist` function to densely compute feature distances. Note that we have all images instead of only one pair of them in mind when performing this panorama stitching, thus **exhaustive** is refering to not the way we compute distance between every pair of features, but the way we compute distance between every pair of images.
+
+We also implement a simple ambiguity check to remove false matches. For an image pair and for one of the feature in the first image, we find the best and second best match in the second image. If the distance ratio between the best and second best match is larger than a threshold, we consider the match to be ambiguous and remove it. The threshold of discarding a matching is controlled dynamically by a user parameter `match_ratio`. Specifically, we find the cut-off value of the distance ratio to retain `match_ratio * 100` percent of all matches and use this cut-off value to determine which match to discard. `match_ratio` is set to `0.9` in all experiments if not specified otherwise (meaning, 90% of all matches will be retained).
+
+### Homography Estimation
+
+The transformation between two images can be described with a homography,
+
 ## Implementation Details
+
+We implemented our pipeline with PyTorch (even the graph shortest path part) for GPU acceleration and further scalability considerations.
+
+With the default arguments, we perform parallel image loading onto the user defined device (RAM or VRAM) and perform feature detection and description on the GPU. We then perform exhaustive feature matching on the CPU and GPU, after which homography estimation are done on the GPU. We then perform panorama stitching on the GPU.
 
 ## Experiments
 
