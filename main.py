@@ -273,21 +273,24 @@ def visualize_detection(imgs: torch.Tensor,
     imgs: np.ndarray = imgs.detach().cpu().numpy()
     pack: np.ndarray = pack.detach().cpu().numpy()
     os.makedirs(outdir, exist_ok=True)
-    for i, img, kps in zip(range(len(imgs)), imgs, pack):
-        img = (img.clip(0, 1) * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
+
+    def write_one_detection(i, img, kps):
+        img = (img * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
         kps = [cv2.KeyPoint(*d) for d in kps]
         img = cv2.drawKeypoints(img, kps, img, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
         path = join(outdir, f'detect{i:02d}.jpg')
         cv2.imwrite(path, img)
 
+    parallel_execution(list(range(len(imgs))), list(imgs), list(pack), action=write_one_detection, print_progress=True)
 
-def visualize_matching(imgs: torch.Tensor,  # B, H, W, 3
-                       lafs: torch.Tensor,  # B, N, 2, 3
-                       resp: torch.Tensor,  # B, N,
-                       valid: torch.Tensor,  # B, B, N
-                       match: torch.Tensor,  # B, B, N
-                       outdir: str,
-                       ratio=1.0):
+
+def visualize_match(imgs: torch.Tensor,  # B, H, W, 3
+                    lafs: torch.Tensor,  # B, N, 2, 3
+                    resp: torch.Tensor,  # B, N,
+                    valid: torch.Tensor,  # B, B, N
+                    match: torch.Tensor,  # B, B, N
+                    outdir: str,
+                    ratio=1.0):
     B, H, W, C = imgs.shape
     B, N = resp.shape
     os.makedirs(outdir, exist_ok=True)
@@ -299,42 +302,44 @@ def visualize_matching(imgs: torch.Tensor,  # B, H, W, 3
     resp: np.ndarray = resp.detach().cpu().numpy()
     valid: np.ndarray = valid.detach().cpu().numpy()
     match: np.ndarray = match.detach().cpu().numpy()
-    for prev in range(B):
-        for next in range(B):
 
-            # Find the matches between prev and next
-            valid_prev_next: np.ndarray = valid[prev, next]  # N,
-            match_prev_next: np.ndarray = match[prev, next]  # N, stores matched feature id
-            valid_prev_next: np.ndarray = valid_prev_next.nonzero()[0]  # M,
-            match_prev_next: np.ndarray = match_prev_next[valid_prev_next]  # M, valid matches target
+    def write_one_match(prev, next):
+        # Find the matches between prev and next
+        valid_prev_next: np.ndarray = valid[prev, next]  # N,
+        match_prev_next: np.ndarray = match[prev, next]  # N, stores matched feature id
+        valid_prev_next: np.ndarray = valid_prev_next.nonzero()[0]  # M,
+        match_prev_next: np.ndarray = match_prev_next[valid_prev_next]  # M, valid matches target
 
-            # Get target values
-            img_prev = imgs[prev]
-            img_next = imgs[next]
-            kps_prev = pack[prev]  # source, M,
-            kps_next = pack[next]  # pivot, M,
+        # Get target values
+        img_prev = imgs[prev]
+        img_next = imgs[next]
+        kps_prev = pack[prev]  # source, M,
+        kps_next = pack[next]  # pivot, M,
 
-            # Prepare source and pivot images
-            img_prev = (img_prev.clip(0, 1) * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
-            img_next = (img_next.clip(0, 1) * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
-            kps_prev = [cv2.KeyPoint(*d) for d in kps_prev]  # M,
-            kps_next = [cv2.KeyPoint(*d) for d in kps_next]  # M,
+        # Prepare source and pivot images
+        img_prev = (img_prev * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
+        img_next = (img_next * 255).astype(np.uint8)[..., ::-1].copy()  # bgr to rgb -> contiguous
+        kps_prev = [cv2.KeyPoint(*d) for d in kps_prev]  # M,
+        kps_next = [cv2.KeyPoint(*d) for d in kps_next]  # M,
 
-            # Prepare matching parameters
-            matches1to2 = [cv2.DMatch(s, p, 0, 0) for s, p in zip(valid_prev_next, match_prev_next)]
+        # Prepare matching parameters
+        matches1to2 = [cv2.DMatch(s, p, 0, 0) for s, p in zip(valid_prev_next, match_prev_next)]
 
-            # Draw matches visualization on canvas image
-            canvas = np.zeros([H, 2 * W, 3])
-            canvas = cv2.drawMatches(img_prev, kps_prev, img_next, kps_next, matches1to2, canvas, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)  # weird...
-            path = join(outdir, f'match{prev:02d}-{next:02d}.jpg')
-            cv2.imwrite(path, canvas)
+        # Draw matches visualization on canvas image
+        canvas = np.zeros([H, 2 * W, 3])
+        canvas = cv2.drawMatches(img_prev, kps_prev, img_next, kps_next, matches1to2, canvas, flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)  # weird...
+        path = join(outdir, f'match{prev:02d}-{next:02d}.jpg')
+        cv2.imwrite(path, canvas)
+
+    prevs, nexts = np.meshgrid(np.arange(B), np.arange(B), indexing='ij')
+    parallel_execution(list(prevs.ravel()), list(nexts.ravel()), action=write_one_match, print_progress=True)
 
 
 def random_sampling_consensus(pvt: torch.Tensor,
                               src: torch.Tensor,
                               min_sample: int = 4,
-                              inlier_iter: int = 100,
-                              inlier_crit: float = 1e-5,
+                              min_iter: int = 100,
+                              threshold: float = 1e-5,
                               confidence: float = 1 - 1e-5,
                               max_iter: int = 10000,
                               m_repeat: int = 2,  # repeat m-estimator 10 times
@@ -365,7 +370,7 @@ def random_sampling_consensus(pvt: torch.Tensor,
 
         # Find ratio of inlier
         crit = (pred - pvt).pow(2).sum(-1)
-        crit = crit < inlier_crit  # SSD critical threshold
+        crit = crit < threshold  # SSD critical threshold
         ratio = crit.sum().item() / crit.numel()  # MARK: SYNC
         if ratio > max_ratio:
             max_ratio = ratio
@@ -375,7 +380,7 @@ def random_sampling_consensus(pvt: torch.Tensor,
 
         # Determine whether to continue
         min_iter = find_min_iter(max_ratio, confidence, min_sample)
-        min_iter = max(min_iter, inlier_iter)
+        min_iter = max(min_iter, min_iter)
         if not quite:
             log(f'RANSAC random sampling:')
             log(f'Iter: {colored(f"{i}", "magenta")}')
@@ -398,7 +403,7 @@ def random_sampling_consensus(pvt: torch.Tensor,
 
         # Find ratio of inlier
         crit = (pred - pvt).pow(2).sum(-1)
-        crit = crit < inlier_crit  # SSD critical threshold
+        crit = crit < threshold  # SSD critical threshold
         ratio = crit.sum().item() / crit.numel()  # MARK: SYNC
         if ratio > max_ratio:
             max_ratio = ratio
@@ -415,7 +420,7 @@ def random_sampling_consensus(pvt: torch.Tensor,
 
     # Type conversion for accuracy
     best_fit = best_fit.to(dtype)
-    return best_fit, ransac_iter, inlier_ratio
+    return best_fit, ransac_iter, min_iter, inlier_ratio
 
 
 def apply_homography(src: torch.Tensor, homography: torch.Tensor):
@@ -580,7 +585,7 @@ def main():
     if args.visualize:
         outdir = join(args.data_root, args.output_dir, "match")
         log(f'Visualizing matched feature at: {cyan(join(args.data_root, args.output_dir))}')
-        visualize_matching(imgs, lafs, resp, valid, match, outdir, args.ratio)
+        visualize_match(imgs, lafs, resp, valid, match, outdir, args.ratio)
 
     log(f'Constructing sequential homography on: {colored(f"{args.device}", "cyan")}')
     pivot = pivot if args.pivot < 0 else args.pivot  # use user pivot if defined
@@ -597,6 +602,7 @@ def main():
     visited = connect.new_zeros(B, B, dtype=torch.bool)  # zero indicateds not visited
     match_map = connect.new_zeros(B, B, dtype=torch.long)
     iter_map = connect.new_zeros(B, B, dtype=torch.long)
+    min_iter_map = connect.new_zeros(B, B, dtype=torch.long)
     ratio_map = connect.new_zeros(B, B, dtype=torch.float)
 
     # Things should be moved to cpu first to avoid excessive syncing
@@ -604,6 +610,7 @@ def main():
     visited = visited.detach().cpu().numpy()
     match_map = match_map.detach().cpu().numpy()
     iter_map = iter_map.detach().cpu().numpy()
+    min_iter_map = min_iter_map.detach().cpu().numpy()
     ratio_map = ratio_map.detach().cpu().numpy()
     paths = [[extract_path_from_connect(i, j, connect) for j in range(B)] for i in range(B)]
 
@@ -617,7 +624,7 @@ def main():
         if source == pivot:
             ret.append([0, 0, W, H, imgs[source],
                         torch.ones_like(imgs[source][0], dtype=torch.bool), ])
-            meta.append([source, pivot, -1, -1, -1, -1, [], torch.eye(3, dtype=homographies.dtype, device=homographies.device)])
+            meta.append([source, pivot, -1, -1, -1, -1, -1, [], torch.eye(3, dtype=homographies.dtype, device=homographies.device)])
             continue
 
         # If not pivot image, do a connected homography to pivot
@@ -628,6 +635,7 @@ def main():
         cum = 0
         cum_match = 0
         cum_iter = 0
+        cum_min_iter = 0
         cum_ratio = 1.0
         prev = source
         cum_homo = torch.eye(3, dtype=homographies.dtype, device=homographies.device)  # 3, 3
@@ -648,13 +656,21 @@ def main():
                 pvt = pvt / scale  # normalize the images to 0, 1
 
                 # Perform RANSAC
-                homo, iter, ratio = random_sampling_consensus(pvt, src, quite=not args.verbose)
+                homo, iter, min_iter, ratio = random_sampling_consensus(pvt,
+                                                                        src,
+                                                                        min_iter=args.ransac_min_iter,
+                                                                        max_iter=args.ransac_max_iter,
+                                                                        m_repeat=args.m_estimator_repeat,
+                                                                        threshold=args.ransac_threshold,
+                                                                        confidence=args.ransac_confidence,
+                                                                        quite=not args.verbose)
 
                 # Prepare results
                 visited[prev, next] = 1
                 homographies[prev, next] = homo
                 match_map[prev, next] = len(src)
                 iter_map[prev, next] = iter
+                min_iter_map[prev, next] = min_iter
                 ratio_map[prev, next] = ratio
 
             # If already visited, just left multiply
@@ -662,6 +678,7 @@ def main():
             cum_homo = cum_homo / cum_homo[..., -1, -1]
             cum_match += match_map[prev, next]
             cum_iter += iter_map[prev, next]
+            cum_min_iter += min_iter_map[prev, next]
             cum_ratio *= ratio_map[prev, next]
             cum += 1
 
@@ -672,7 +689,7 @@ def main():
         log(f'Applying homography: {magenta(pretty_list(cum_homo.ravel().tolist()))}')
         min_x, min_y, max_x, max_y, img, msk = homography_transform(imgs[source], cum_homo)
         ret.append([min_x, min_y, max_x, max_y, img, msk, ])
-        meta.append([source, pivot, cum_match, cum_iter, cum_ratio, cum, shortest_path, cum_homo])
+        meta.append([source, pivot, cum_match, cum_iter, cum_min_iter, cum_ratio, cum, shortest_path, cum_homo])
 
     ret = list(zip(*ret))  # inverted batching
     can_min_x = min(ret[0])
@@ -704,12 +721,13 @@ def main():
     # Output some summary for debugging
     log(f'Summary:')
     for source in range(len(meta)):
-        source, pivot, cum_match, cum_iter, cum_ratio, cum, shortest_path, cum_homo = meta[source]
+        source, pivot, cum_match, cum_iter, cum_min_iter, cum_ratio, cum, shortest_path, cum_homo = meta[source]
         min_x, min_y, max_x, max_y, img, msk = ret[source]
         log(f'Pair: {magenta(f"{source:02d}-{pivot:02d}")}')
         log(f'-- Number of matches:  {magenta(cum_match)}')
         log(f'-- Final inlier ratio: {magenta(f"{cum_ratio:.6f}")}')
         log(f'-- RANSAC iteration:   {magenta(cum_iter)}')
+        log(f'-- RANSAC expected:    {magenta(cum_min_iter)}')
         log(f'-- Best connection:    {magenta(shortest_path)}')
         log(f'-- Homography matrix:  {magenta(pretty_list(cum_homo.ravel().tolist()))}')
 
