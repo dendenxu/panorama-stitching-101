@@ -45,7 +45,7 @@ The transformation between two images can be described with a homography, define
 We perform RANSAC on top of the proposed DLT algorithm to obtain a good estimation and discard outliers reliably. During experiments we found that RANSAC essential to the success of the homography estimation. Since one or two outliers would lead to a completely wrong result. We first perform a few random experiments `min_iter` to determine the number of iterations required to achieve a certain `confidence` level. The number of expected iterations `exp_min_iter` is dynamically changed with the estimated ratio of inlier `inlier_ratio`. `exp_min_iter` is determined with the following equation:
 
 ```python
-def find_min_iter(inlier_ratio, confidence, min_sample): 
+def find_min_iter(inlier_ratio, confidence, min_sample):
     return int(np.ceil(np.log(1 - confidence) / np.log(1 - inlier_ratio**min_sample)))
 ```
 
@@ -59,15 +59,82 @@ To obtain a more robust estimation, we repeat the M-estimator with the updated i
 
 ### Graph-based Sequential Homography
 
+This section is not required by the homework specification. But we found that to generate a good panorama image, it's important to consider all the images in a set instead of just two of them. In a large image set, it's very common find two images without any overlap. However it is typically possible to find a path of images that connect them with partial overlap along the way. In this case, it's natural to consider the concatenated path of homography instead of just a single one of them.
 
+To find this homography, we define a connectivity image graph on the collection of images. We represent this graph via a modified version of the adjacency matrix, where the $j$th element of the $i$th row on the matrix represent the reciprocal of the number of matches from image $i$ to image $j$. Thus, to find the best sequence of homography between any pair of images, we apply the Floyd-Warshall algorithm on the modified adjacency matrix to find the all pair shortest path and shortest distance of this graph. We implemented a parallel GPU version of the algorithm where only an outer loop of $N$, instead of $N^3$ is required, compared to the naive Floyd-Warshall implementation:
+
+```python
+def parallel_floyd_warshall(distance: torch.Tensor):
+    # The Floyd-Warshall algorithm is a popular algorithm for finding the shortest path for each vertex pair in a weighted directed graph.
+    # https://www.baeldung.com/cs/floyd-warshall-shortest-path
+    # https://cse.buffalo.edu/faculty/miller/Courses/CSE633/Asmita-Gautam-Spring-2019.pdf
+    # https://saadmahmud14.medium.com/parallel-programming-with-cuda-tutorial-part-4-the-floyd-warshall-algorithm-5e1281c46bf6
+    assert distance.shape[-1] == distance.shape[-2], 'Graph matrix should be square'
+    V = distance.shape[-1]
+
+    # Connection matrix, later used for extracting shortest path
+    connect = distance.new_full(distance.shape, fill_value=-1, dtype=torch.long)
+    for k in range(V):
+        connect_with_k = distance[:, k:k + 1].expand(-1, V) + distance[k:k + 1, :].expand(V, -1)
+        closer_with_k = connect_with_k < distance
+        distance = torch.where(closer_with_k, connect_with_k, distance)
+        connect = torch.where(closer_with_k, k, connect)  # if 1, go to k, else stay put
+    return distance, connect  # geodesic distance (closest distance of every pair of element)
+
+
+def extract_path_from_connect(i, j, connect) -> List[int]:
+    # https://stackoverflow.com/questions/64163232/how-to-record-the-path-in-this-critical-path-algo-python-floyd-warshall
+    k = connect[i][j]
+    if k == -1:
+        return [i, j]
+    else:
+        path = extract_path_from_connect(i, k, connect)
+        path.pop()  # remove k to avoid duplicates
+        path.extend(extract_path_from_connect(k, j, connect))
+        return path
+```
+
+Now, we the shortest path between image pairs available, we find every pair of homography along the way and concatenate them with matrix multiplication. Note that we still require a pivot image to perform the final stitching. It might be helpful to construct a best virtual image plane for all the homography in the future. The shortest path and its corresponding homography transformation from every image to the pivot is computed in this stage.
 
 ### Panorama Stitching
+
+Afterwards, we warp all pixels from the source image to the pivot by the homogrphy:
+
+1. First we define the four corners of the source image in its original frame.
+2. Then we transform the corners to the pivot to determine the range of pixels (in a rectangle `meshgrid`) to sample in the pivot's space.
+3. Using the inverse of the homography, we warp the samples back to the source image, and perform `grid_sample` to get the pixel value.
+4. Note that we also record a binary mask to determine whether a pixel is valid since not all samples from the rectangle in step 2 is valid.
+5. All those pixel values are assigned to the preallocated `meshgrid` defined in step 2 and returned along with the binary mask.
+
+We perform the final image stitching with a simple parallel linear blending algorithm:
+
+1. First we determine the final canvas size to fit all samples in step 2 of the previous procedure.
+2. Then we accumulate the pixel values and mask values by simply summing them up.
+3. The division result between the pixel values and mask values produces the final pixel values of the blended image.
 
 ## Implementation Details
 
 We implemented our pipeline with PyTorch (even the graph shortest path part) for GPU acceleration and further scalability considerations.
 
 With the default arguments, we perform parallel image loading onto the user defined device (RAM or VRAM) and perform feature detection and description on the GPU. We then perform exhaustive feature matching on the CPU and GPU, after which homography estimation are done on the GPU. We then perform panorama stitching on the GPU.
+
+Every experiments except `data1` should take no longer than 30 seconds to finish on an RTX 2080 Ti GPU with the default arguments.
+`data1` should take no longer than 60 seconds with the default arguments.
+
+```shell
+python main.py --data_root <DATASET_ROOT/IMAGE_SET>
+
+# examples:
+python main.py --data_root data/data1 # run on data1 with default arguments, this works with a 2080 Ti
+python main.py --data_root data/data1 --verbose --visualize # run on data1 with default arguments, print every log, save detection and matching results
+python main.py --data_root data/data1 --device cpu --n_feat 10000 --match_ratio 0.7 # run on data1, perform every computation on cpu instead of cuda, extract 10000 instead of 5000 features, and retain 70% instead 90% of all matches
+```
+
+We also provide a simple script to run all sets of images provided in a dataset with both the SIFT and pixel concatenation descriptor.
+
+```shell
+python run_exps.py --data_root <DATASET_ROOT>
+```
 
 ## Experiments
 
