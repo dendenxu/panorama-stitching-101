@@ -1,6 +1,6 @@
-# Panorama Stitching 101
+# Panorama Stitching 101 with Graph-based Sequential Homography
 
-![data1](readme.assets/data1.jpg)
+<img src="readme.assets/data1.jpg" alt="data1" style="zoom:30%;" />
 
 ## Introduction
 
@@ -25,7 +25,7 @@ We evaluate the performance of our algorithm on 4 sets of images. Note that the 
 
 ## Method
 
-![teaser](readme.assets/teaser.jpg)
+<img src="readme.assets/teaser.jpg" alt="teaser" style="zoom:30%;" />
 
 ### Feature Detection and Descriptor
 
@@ -146,31 +146,31 @@ Here we provide the final stitching images for all datasets provided:
 
 #### `data1`
 
-![data1](readme.assets/data1.jpg)
+<img src="readme.assets/data1.jpg" alt="data1" style="zoom:30%;" />
 
 #### `data2`
 
-![data1](readme.assets/data2.jpg)
+<img src="readme.assets/data2.jpg" alt="data2" style="zoom:30%;" />
 
 #### `data3`
 
-![data1](readme.assets/data3.jpg)
+<img src="readme.assets/data3.jpg" alt="data3" style="zoom:30%;" />
 
 #### `data4`
 
-![data1](readme.assets/data4.jpg)
+<img src="readme.assets/data4.jpg" alt="data4" style="zoom:30%;" />
 
 #### Comparison Between `SIFT` And `Pixel` Descriptor
 
 On `data1`, image `0` to image `1`
 
-**Pixel Concatenation Descriptor:**
-
-![pixel](readme.assets/match00-01-pixel.jpg)
-
 **SIFT Descriptor**
 
-![sift](readme.assets/match00-01-sift.jpg)
+<img src="readme.assets/match00-01-sift.jpg" alt="match00-01-sift" style="zoom:30%;" />
+
+**Pixel Concatenation Descriptor:**
+
+<img src="readme.assets/match00-01-pixel.jpg" alt="match00-01-pixel" style="zoom:30%;" />
 
 It's easy to notice that the **SIFT** has a stronger ability to match the inliers in the middle of the image regions.
 
