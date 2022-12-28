@@ -1,5 +1,7 @@
 # Panorama Stitching 101
 
+![data1](readme.assets/data1.jpg)
+
 ## Introduction
 
 Computer Vision homework #2.
@@ -22,6 +24,8 @@ We are not sure whether such algorithm exist in literature due to limited knowle
 We evaluate the performance of our algorithm on 4 sets of images. Note that the number of images in the provided dataset is quite small (3-5 images). We also provide a comparison between the SIFT descriptor and concatenated pixel descriptor, analysing their respective influence on the number of RANSAC iterations.
 
 ## Method
+
+![teaser](readme.assets/teaser.jpg)
 
 ### Feature Detection and Descriptor
 
@@ -138,4 +142,55 @@ python run_exps.py --data_root <DATASET_ROOT>
 
 ## Experiments
 
-## Conclusion
+Here we provide the final stitching images for all datasets provided:
+
+#### `data1`
+
+![data1](readme.assets/data1.jpg)
+
+#### `data2`
+
+![data1](readme.assets/data2.jpg)
+
+#### `data3`
+
+![data1](readme.assets/data3.jpg)
+
+#### `data4`
+
+![data1](readme.assets/data4.jpg)
+
+#### Comparison Between `SIFT` And `Pixel` Descriptor
+
+On `data1`, image `0` to image `1`
+
+**Pixel Concatenation Descriptor:**
+
+![pixel](readme.assets/match00-01-pixel.jpg)
+
+**SIFT Descriptor**
+
+![sift](readme.assets/match00-01-sift.jpg)
+
+It's easy to notice that the **SIFT** has a stronger ability to match the inliers in the middle of the image regions.
+
+A table summarizing all RANSAC experiments (`match_ratio: 0.9, confidence: 1-1e-5, threshold: 1e-5`):
+
+|               | RANSAC iter(`SIFT`) | Inlier ratio (`SIFT`) | RANSAC iter (`pixel`) | Inlier ratio (`pixel`) |
+| ------------- | ------------------- | --------------------- | --------------------- | ---------------------- |
+| `data1-00-02` | 109                 | 0.562674              | 80                    | 0.507998               |
+| `data1-01-02` | 53                  | 0.667253              | 59                    | 0.651235               |
+| `data1-03-02` | 25                  | 0.783849              | 30                    | 0.751966               |
+| `data1-04-02` | 31                  | 0.746356              | 40                    | 0.708920               |
+| `data1-05-02` | 27                  | 0.768663              | 24                    | 0.791209               |
+| `data2-00-02` | 80                  | 0.506760              | 60                    | 0.577648               |
+| `data2-01-02` | 48                  | 0.680380              | 39                    | 0.714286               |
+| `data2-03-02` | 39                  | 0.711083              | 20                    | 0.819625               |
+| `data3-00-01` | 87                  | 0.593607              | 135                   | 0.534940               |
+| `data3-02-01` | 42                  | 0.703209              | 115                   | 0.555874               |
+| `data4-00-02` | 61                  | 0.566602              | 25                    | 0.783529               |
+| `data4-01-02` | 32                  | 0.743830              | 46                    | 0.687500               |
+| `data4-03-02` | 41                  | 0.705437              | 70                    | 0.544305               |
+| Average       | 51.92               | 0.672285              | 57.15                 | 0.663772               |
+
+It's clear that using SIFT descriptor would often lead to smaller number of iterations due to the larger number of inliers.
